@@ -1,0 +1,203 @@
+\documentclass[10pt,a4paper,twocolumn]{article}
+
+\usepackage[top=1.8cm, bottom=1.8cm, left=1.5cm, right=1.5cm, columnsep=0.6cm]{geometry}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{amsmath}
+\usepackage{setspace}
+
+% Colors
+\definecolor{navyblue}{HTML}{1a1a2e}
+\definecolor{darkblue}{HTML}{16213e}
+\definecolor{accentblue}{HTML}{0f3460}
+
+% Section formatting
+\titleformat{\section}{\normalfont\bfseries\fontsize{9.5}{11}\selectfont\color{darkblue}}{\thesection.}{0.4em}{}[\vspace{-4pt}\textcolor{darkblue}{\rule{\linewidth}{0.5pt}}]
+\titleformat{\subsection}{\normalfont\bfseries\fontsize{9}{10.5}\selectfont\itshape}{\thesubsection}{0.4em}{}
+\titlespacing{\section}{0pt}{8pt}{4pt}
+\titlespacing{\subsection}{0pt}{5pt}{2pt}
+
+% Paragraph spacing
+\setlength{\parskip}{3pt}
+\setlength{\parindent}{0pt}
+
+% Header/footer
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\fontsize{7}{8}\selectfont\textcolor{darkblue}{\textit{UAV-Based Post-Disaster Debris Detection --- Project Proposal}}}
+\fancyhead[R]{\fontsize{7}{8}\selectfont\textcolor{darkblue}{MSDSM Batch 4 $\cdot$ 2404107067}}
+\fancyfoot[C]{\fontsize{7}{8}\selectfont\thepage\ of \pageref{LastPage}}
+
+% Hyperlink style
+\hypersetup{colorlinks=true, urlcolor=accentblue, linkcolor=accentblue, breaklinks=true}
+
+% Tighter itemize
+\setlist[itemize]{noitemsep, topsep=2pt, leftmargin=*}
+
+\begin{document}
+
+% ─── Title block ────────────────────────────────────────────────────────────
+\twocolumn[{%
+\begin{center}
+  {\fontsize{14}{17}\bfseries\color{navyblue}
+    High-Resolution UAV-Based Post-Disaster Debris Detection:\\[2pt]
+    Fine-Tuning Foundation Models on Multi-Source Aerial Imagery}\\[6pt]
+  {\fontsize{9}{11}\selectfont\itshape\color{gray}
+    Utkarsh Kaushik \quad $\cdot$ \quad MSDSM Batch 4 \quad $\cdot$ \quad Roll No.\ 2404107067 \quad $\cdot$ \quad 27 February 2026}\\[2pt]
+  {\fontsize{8.5}{10}\selectfont\textcolor{gray}{Project Proposal --- Humanitarian AI for Disaster Response}}
+\end{center}
+\vspace{4pt}
+\textcolor{darkblue}{\rule{\linewidth}{1pt}}
+\vspace{6pt}
+}]
+
+% ─── 1. Introduction ────────────────────────────────────────────────────────
+\section{Introduction}
+
+Natural disasters cause devastating infrastructure damage, with hurricanes alone
+inflicting over \textbf{\$50 billion} in annual losses in the United States.
+Rapid, accurate debris assessment is critical for emergency response coordination,
+yet traditional manual surveys are dangerous, time-consuming, and unscalable.
+Unmanned Aerial Vehicles (UAVs) have emerged as essential tools for post-disaster
+reconnaissance, generating high-resolution imagery that exceeds satellite capabilities
+in spatial resolution and temporal flexibility.
+
+This project addresses \textbf{automated debris detection and segmentation} from UAV
+imagery using open-vocabulary vision-language models. Current state-of-the-art
+models such as Florence-2 and SAM2 exhibit limited performance on disaster-specific
+scenarios due to domain shift from natural imagery to debris-filled, structurally
+compromised environments. We propose domain-specific fine-tuning of these foundation
+models on curated post-disaster UAV datasets to enable: (1)~\textbf{text-guided
+debris queries} without predefined categories, (2)~\textbf{pixel-accurate
+segmentation} for damage quantification, and (3)~\textbf{rapid deployment} for
+emergency response teams.
+
+% ─── 2. Methodology ─────────────────────────────────────────────────────────
+\section{Methodology}
+
+The proposed architecture implements a \textbf{cascaded fine-tuning pipeline}
+leveraging complementary strengths of vision-language and segmentation foundation
+models.
+
+\subsection{Florence-2 Fine-Tuning for Debris Detection}
+
+Florence-2 (Microsoft, 2024) serves as the open-vocabulary detection backbone.
+We employ \textbf{Low-Rank Adaptation (LoRA)} with rank $r{=}16$ and
+$\alpha{=}32$ to efficiently adapt the model to disaster-specific vocabulary.
+The training objective optimises detection of debris categories---including
+damaged buildings, flooded regions, scattered rubble, and vegetation
+debris---via task-specific prompting with
+\texttt{\small<OPEN\_VOCABULARY\_DETECTION>} tokens.
+Domain adaptation addresses irregular debris patterns, occlusion from structural
+collapse, and heterogeneous lighting conditions in UAV-captured imagery.
+
+\subsection{SAM-2 Fine-Tuning for Precise Segmentation}
+
+SAM-2 (Meta AI, 2024) provides pixel-accurate mask generation guided by bounding
+boxes from Florence-2. We adopt a \textbf{partial fine-tuning strategy}, freezing
+the Hiera image encoder while training the prompt encoder and mask decoder on
+aerial disaster imagery. This preserves general visual features while adapting
+mask prediction to debris boundaries. The combined loss integrates Dice loss for
+mask overlap and binary cross-entropy for boundary refinement.
+
+\subsection{Integrated Inference Pipeline}
+
+The deployed system processes UAV imagery through: (1)~Florence-2 open-vocabulary
+detection with domain-adapted prompts, (2)~coordinate transformation for SAM-2
+compatibility, (3)~mask generation with multi-scale refinement, and (4)~priority-based
+filtering using a debris taxonomy (critical infrastructure damage, blocked access
+routes, hazardous materials). Outputs include GIS-compatible GeoJSON, structured
+JSON reports for emergency management systems, and visual priority maps.
+
+% ─── 3. Datasets ────────────────────────────────────────────────────────────
+\section{Datasets}
+
+The proposed technique is evaluated on three complementary high-resolution UAV
+datasets curated for post-disaster analysis.
+
+\subsection{RescueNet}
+\textit{Source:} Alam et al., IEEE TGRS, 2022.
+\textit{Scale:} 4,494 images at 0.5--2\,cm/px GSD from Hurricane Michael (FL, 2018).
+Pixel-level semantic segmentation with 8 classes: Background, Water,
+Building-No-Damage, Building-Damaged, Vegetation, Road-No-Damage, Road-Damaged,
+and Vehicle. Captures structural collapse, vegetation blockage, and road
+obstruction from a Category~5 hurricane. Official train/val/test splits enable
+standardised evaluation.
+
+\subsection{DesignSafe-CI PRJ-6029}
+\textit{Source:} NSF NHERI DesignSafe-CI Repository.
+DOI: \href{https://doi.org/10.17603/ds2-jvps-2n95}{10.17603/ds2-jvps-2n95}.
+Multi-hazard UAV and ground-based imagery from earthquakes, hurricanes, and floods
+with georeferenced damage observations. Enables cross-disaster generalisation
+testing; companion datasets support structural damage assessment and multi-modal
+fusion research.
+
+\subsection{MSNet Dataset}
+\textit{Source:} Xie \& Xiong, Remote Sensing, 2023.
+8,700+ images across 7 disaster events at 0.3--5\,cm/px.
+Multi-scale damage classification (no damage, minor, major, destroyed) with
+oriented bounding boxes and instance segmentation. Covers earthquakes (Chile,
+Ecuador), hurricanes (Michael, Laura), and tsunami events, enabling evaluation
+across varying UAV altitudes and sensor configurations.
+
+\smallskip
+\textbf{Evaluation Protocol.}~We adopt mean Intersection-over-Union (mIoU) for
+segmentation, F1-score for debris detection, and Average Precision (AP) at IoU
+$\in[0.5{:}0.95]$. Cross-dataset validation trains on RescueNet and tests on
+DesignSafe-CI and MSNet holdout regions.
+
+% ─── 4. Expected Outcomes ───────────────────────────────────────────────────
+\section{Expected Outcomes}
+
+This project anticipates four primary contributions to humanitarian computing:
+
+\begin{itemize}
+  \item \textbf{Domain-Adapted Foundation Models:} Publicly released Florence-2
+    and SAM-2 checkpoints fine-tuned on post-disaster UAV imagery, enabling
+    zero-shot deployment for resource-constrained emergency response organisations.
+  \item \textbf{Cross-Dataset Benchmark:} Standardised evaluation protocol and
+    baseline results across RescueNet, DesignSafe-CI, and MSNet, establishing
+    reference metrics for high-resolution aerial debris detection.
+  \item \textbf{Open-Source Deployment Framework:} Gradio-based web interface and
+    Python API with export formats compatible with FEMA debris management systems
+    and common GIS platforms.
+  \item \textbf{Transfer Learning Analysis:} Empirical study of foundation model
+    transfer across disaster types (hurricane vs.\ earthquake), informing data
+    collection priorities for future dataset construction.
+\end{itemize}
+
+% ─── 5. References ──────────────────────────────────────────────────────────
+\section{References}
+
+\fontsize{7.5}{9.5}\selectfont
+\setlength{\parskip}{2pt}
+
+\noindent[1] M.\,S.\ Alam et al., ``RescueNet: A High-Resolution Post-Disaster UAV Dataset
+for Semantic Segmentation,'' \textit{IEEE Trans.\ Geosci.\ Remote Sens.}, vol.~60, 2022.
+
+\noindent[2] K.\ Amini et al., ``Hurricane-Induced Debris Segmentation Dataset Using Aerial
+Imagery'' [v2], DesignSafe-CI, 2025. \href{https://doi.org/10.17603/ds2-jvps-2n95}{doi:10.17603/ds2-jvps-2n95}
+
+\noindent[3] X.\ Zhu, J.\ Liang, and A.\ Hauptmann, ``MSNet: A Multilevel Instance
+Segmentation Network for Natural Disaster Damage Assessment in Aerial Videos,''
+\textit{WACV}, pp.~2023--2032, 2021.
+
+\noindent[4] W.\ Xiao et al., ``Florence-2: Advancing a Unified Representation for a Variety
+of Vision Tasks,'' \textit{CVPR}, 2024.
+
+\noindent[5] N.\ Ravi et al., ``SAM~2: Segment Anything in Images and Videos,''
+\textit{arXiv:2408.00714}, 2024.
+
+\noindent[6] E.\,J.\ Hu et al., ``LoRA: Low-Rank Adaptation of Large Language Models,''
+\textit{ICLR}, 2022.
+
+\end{document}
