@@ -78,7 +78,7 @@ class DataConfig:
     dataset_root: str = "./datasets"
 
     # Image settings
-    image_size: int = 768
+    image_size: int = 512
     image_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
     image_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
@@ -128,8 +128,8 @@ class Florence2Config:
     learning_rate: float = 5e-5
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
-    gradient_accumulation_steps: int = 4
-    max_new_tokens: int = 1024
+    gradient_accumulation_steps: int = 2
+    max_new_tokens: int = 512
     num_beams: int = 3
 
     # Early stopping
@@ -157,7 +157,8 @@ class SAM2Config:
     num_epochs: int = 20
     learning_rate: float = 1e-5
     weight_decay: float = 0.01
-    batch_size: int = 2
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 2
     multimask_output: bool = True
 
     # Loss weights

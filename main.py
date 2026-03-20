@@ -136,6 +136,9 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        # Enable TF32 for faster fp32 fallback ops on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -344,6 +347,50 @@ def download(args):
         sys.exit(1)
 
 
+class _FilteredSubset(torch.utils.data.Dataset):
+    """Subset wrapper that keeps only non-empty samples by precomputed indices."""
+
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]]
+
+
+def _filter_empty_samples(dataset):
+    """Remove samples with zero detections (no bboxes) to avoid wasted forward passes."""
+    if not hasattr(dataset, 'samples'):
+        return dataset
+
+    non_empty_indices = []
+    for i, (_, mask_path) in enumerate(dataset.samples):
+        # Quick check: if mask file exists, assume it may have detections
+        # We'll do a lightweight check using the sample list
+        non_empty_indices.append(i)
+
+    # Actually scan for empty masks — use connected component info already cached
+    # For now, just remove blank samples (those where image couldn't be read)
+    valid_indices = []
+    total = len(dataset)
+    for i in range(total):
+        sample = dataset[i]
+        if sample["target"]["bboxes"].shape[0] > 0:
+            valid_indices.append(i)
+
+    removed = total - len(valid_indices)
+    if removed > 0:
+        logger.info(
+            "Filtered %d empty samples from training set (%d → %d)",
+            removed, total, len(valid_indices),
+        )
+        return _FilteredSubset(dataset, valid_indices)
+    return dataset
+
+
 def train_florence(args, config: ExperimentConfig):
     from hurricane_debris.models.florence2 import Florence2Trainer
 
@@ -353,6 +400,9 @@ def train_florence(args, config: ExperimentConfig):
 
     train_ds = load_dataset(args, config, "train")
     val_ds = load_dataset(args, config, "val")
+
+    # Filter out samples with no detections (empty targets waste forward passes)
+    train_ds = _filter_empty_samples(train_ds)
 
     trainer = Florence2Trainer(config=config.florence2, device=config.resolve_device())
     trainer.setup_lora()

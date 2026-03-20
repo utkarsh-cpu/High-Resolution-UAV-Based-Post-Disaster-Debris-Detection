@@ -1,6 +1,6 @@
 """
-SAM2 Fine-Tuning for Debris Segmentation (FIXED)
-=================================================
+SAM2 Fine-Tuning for Debris Segmentation (OPTIMIZED)
+=====================================================
 Key fixes vs. first_draft.py:
   1. Forward pass goes through model sub-modules DIRECTLY (image_encoder →
      prompt_encoder → mask_decoder) instead of calling predictor.predict()
@@ -8,6 +8,16 @@ Key fixes vs. first_draft.py:
   2. Added proper validation loop.
   3. Checkpointing on best *validation* metric, not training loss.
   4. Integrated with centralized config and logging.
+
+Performance optimizations:
+  - Batched image encoder forward (one call per batch, not per image).
+  - Batched box prompts per image (one decoder call per image, not per box).
+  - AMP (autocast + GradScaler) for bfloat16/fp16 mixed precision.
+  - Gradient accumulation for larger effective batch size.
+  - torch.compile on mask decoder for fused kernels.
+  - Gradient checkpointing on mask decoder for VRAM savings.
+  - Cosine annealing with linear warmup scheduler.
+  - DataLoader prefetch_factor for reduced GPU stalls.
 """
 
 import os
@@ -43,6 +53,8 @@ class SAM2Trainer:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.model = None
+        self._amp_dtype = None
+        self._scaler = None
         self._load_model()
 
     # ── Model loading ────────────────────────────────────────────────────
@@ -61,7 +73,8 @@ class SAM2Trainer:
         self.model = self.model.to(self.device)
 
     def setup_fine_tuning(self):
-        """Freeze image encoder; unfreeze prompt encoder + mask decoder."""
+        """Freeze image encoder; unfreeze prompt encoder + mask decoder.
+        Also sets up AMP, torch.compile, and gradient checkpointing."""
         if self.cfg.freeze_image_encoder:
             for param in self.model.image_encoder.parameters():
                 param.requires_grad = False
@@ -83,108 +96,174 @@ class SAM2Trainer:
             f"{trainable:,}", f"{total:,}", 100 * trainable / total,
         )
 
-    # ── Fixed forward pass ───────────────────────────────────────────────
+        # ── AMP setup ───────────────────────────────────────────────────
+        _is_cuda = getattr(self, 'device', 'cpu') == "cuda"
+        if _is_cuda:
+            if torch.cuda.is_bf16_supported():
+                self._amp_dtype = torch.bfloat16
+                # BF16 doesn't need GradScaler
+                self._scaler = None
+            else:
+                self._amp_dtype = torch.float16
+                self._scaler = torch.amp.GradScaler("cuda")
+            logger.info("AMP enabled with %s", self._amp_dtype)
+        else:
+            self._amp_dtype = None
+            self._scaler = None
 
-    def _forward_sam(
-        self,
-        image: torch.Tensor,
-        bboxes: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # ── torch.compile on decoder ─────────────────────────────────────
+        if _is_cuda:
+            try:
+                self.model.sam_mask_decoder = torch.compile(
+                    self.model.sam_mask_decoder
+                )
+                logger.info("torch.compile applied to mask decoder")
+            except Exception as e:
+                logger.warning("torch.compile failed, continuing without: %s", e)
+
+        # ── Gradient checkpointing on decoder ────────────────────────────
+        if hasattr(self.model.sam_mask_decoder, 'gradient_checkpointing_enable'):
+            self.model.sam_mask_decoder.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled on mask decoder")
+
+        # ── cuDNN benchmark for fixed-size inputs ────────────────────────
+        if _is_cuda:
+            torch.backends.cudnn.benchmark = True
+            logger.info("cuDNN benchmark mode enabled")
+
+    # ── Batched image encoder ────────────────────────────────────────────
+
+    def _encode_images_batched(
+        self, images: torch.Tensor
+    ) -> List[Tuple[torch.Tensor, List[torch.Tensor]]]:
         """
-        Forward pass through SAM2 sub-modules, keeping the autograd graph intact.
-
-        FIX: Instead of calling predictor.predict() (which uses no_grad),
-        we directly call:
-          1. image_encoder  (frozen, but still part of the graph for the decoder)
-          2. sam_prompt_encoder  (trainable)
-          3. sam_mask_decoder    (trainable)
+        Run the frozen image encoder on an entire batch at once.
 
         Args:
-            image: [3, H, W] normalised image tensor on device.
-            bboxes: [N, 4] COCO-format boxes [x, y, w, h] on device.
+            images: [B, 3, H, W] batch of images on device.
 
         Returns:
-            masks_pred: [N, H, W] predicted mask logits.
-            iou_scores: [N] predicted IoU scores.
+            List of (image_embed, high_res_feats) tuples, one per image.
         """
-        # ── 1. Image embedding (frozen encoder) ─────────────────────────
-        # SAM2 expects [B, C, H, W] input
-        img_input = image.unsqueeze(0)  # [1, 3, H, W]
+        B = images.shape[0]
 
         with torch.no_grad():
-            image_embedding = self.model.image_encoder(img_input)
-        # image_embedding may be a dict or tuple depending on SAM2 version
+            if self._amp_dtype:
+                with torch.autocast("cuda", dtype=self._amp_dtype):
+                    image_embedding = self.model.image_encoder(images)
+            else:
+                image_embedding = self.model.image_encoder(images)
+
         if isinstance(image_embedding, dict):
             backbone_out = image_embedding
         else:
             backbone_out = {"vision_features": image_embedding}
 
-        # Get the feature map for the mask decoder
-        # SAM2's _prepare_backbone_features handles the conversion
+        results = []
         if hasattr(self.model, '_prepare_backbone_features'):
             _, vision_feats, vision_pos_embeds, feat_sizes = (
                 self.model._prepare_backbone_features(backbone_out)
             )
-            # Get high-res feature maps for mask prediction
-            # vision_feats[-1] is the highest resolution feature
-            B = 1
-            # Flatten vision features to expected SAM2 format
-            image_embed = vision_feats[-1].reshape(B, -1, feat_sizes[-1][0], feat_sizes[-1][1])
-            high_res_feats = [
+            image_embeds = vision_feats[-1].reshape(
+                B, -1, feat_sizes[-1][0], feat_sizes[-1][1]
+            )
+            all_high_res = [
                 vf.reshape(B, -1, fs[0], fs[1])
                 for vf, fs in zip(vision_feats[:-1], feat_sizes[:-1])
             ]
+            for i in range(B):
+                hi_res = [hr[i:i+1] for hr in all_high_res]
+                results.append((image_embeds[i:i+1], hi_res))
         else:
-            image_embed = backbone_out if torch.is_tensor(backbone_out) else backbone_out["vision_features"]
-            high_res_feats = []
+            raw = backbone_out if torch.is_tensor(backbone_out) else backbone_out["vision_features"]
+            for i in range(B):
+                results.append((raw[i:i+1], []))
 
-        all_masks = []
-        all_ious = []
+        return results
 
-        for bbox in bboxes:
-            # ── 2. Convert COCO bbox to SAM2 prompt format ──────────────
-            x, y, w, h = bbox
-            box_coords = torch.tensor(
-                [[x, y, x + w, y + h]], dtype=torch.float32, device=self.device
-            )  # [1, 4]  (xyxy format for SAM)
+    # ── Batched forward pass ─────────────────────────────────────────────
 
-            # ── 3. Prompt encoder (trainable) ───────────────────────────
-            sparse_embeddings, dense_embeddings = self.model.sam_prompt_encoder(
-                points=None,
-                boxes=box_coords,
-                masks=None,
+    def _forward_sam_batched(
+        self,
+        image_embed: torch.Tensor,
+        high_res_feats: List[torch.Tensor],
+        bboxes: torch.Tensor,
+        img_h: int,
+        img_w: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through prompt encoder + mask decoder with ALL boxes
+        for a single image in one call.
+
+        Args:
+            image_embed: [1, C, H_feat, W_feat] image embedding.
+            high_res_feats: list of [1, C, H, W] high-res feature maps.
+            bboxes: [N, 4] COCO-format boxes [x, y, w, h] on device.
+            img_h: original image height.
+            img_w: original image width.
+
+        Returns:
+            masks_pred: [N, img_h, img_w] predicted mask logits.
+            iou_scores: [N] predicted IoU scores.
+        """
+        N = bboxes.shape[0]
+        if N == 0:
+            return (
+                torch.zeros(0, img_h, img_w, device=self.device),
+                torch.zeros(0, device=self.device),
             )
 
-            # ── 4. Mask decoder (trainable) ─────────────────────────────
-            low_res_masks, iou_predictions = self.model.sam_mask_decoder(
-                image_embeddings=image_embed,
-                image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=self.cfg.multimask_output,
-                high_res_features=high_res_feats if high_res_feats else None,
-            )
+        # Convert COCO [x, y, w, h] → SAM [x1, y1, x2, y2]
+        box_coords = torch.zeros(N, 4, dtype=torch.float32, device=self.device)
+        box_coords[:, 0] = bboxes[:, 0]                    # x1
+        box_coords[:, 1] = bboxes[:, 1]                    # y1
+        box_coords[:, 2] = bboxes[:, 0] + bboxes[:, 2]     # x2
+        box_coords[:, 3] = bboxes[:, 1] + bboxes[:, 3]     # y2
 
-            # Select best mask by predicted IoU
-            best_idx = iou_predictions.argmax(dim=-1)  # [1]
-            best_mask = low_res_masks[0, best_idx]  # [1, H_low, W_low]
+        # Prompt encoder — process all boxes at once
+        # SAM expects [N, 4] for batched boxes
+        sparse_embeddings, dense_embeddings = self.model.sam_prompt_encoder(
+            points=None,
+            boxes=box_coords,
+            masks=None,
+        )
 
-            # Upscale to input resolution
-            h_img, w_img = image.shape[1], image.shape[2]
-            mask_upscaled = F.interpolate(
-                best_mask.unsqueeze(0),
-                size=(h_img, w_img),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0).squeeze(0)  # [H, W]
+        # Expand image embedding to match N prompts
+        image_embed_expanded = image_embed.expand(N, -1, -1, -1)
+        high_res_expanded = [
+            hr.expand(N, -1, -1, -1) for hr in high_res_feats
+        ] if high_res_feats else None
 
-            all_masks.append(mask_upscaled)
-            all_ious.append(iou_predictions[0, best_idx])
+        # Mask decoder — all prompts in one call
+        low_res_masks, iou_predictions = self.model.sam_mask_decoder(
+            image_embeddings=image_embed_expanded,
+            image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=self.cfg.multimask_output,
+            high_res_features=high_res_expanded,
+        )
 
-        if all_masks:
-            return torch.stack(all_masks), torch.stack(all_ious)
-        return torch.zeros(0, image.shape[1], image.shape[2], device=self.device), \
-               torch.zeros(0, device=self.device)
+        # Select best mask per prompt by predicted IoU
+        # low_res_masks: [N, num_masks, H_low, W_low]
+        # iou_predictions: [N, num_masks]
+        best_idx = iou_predictions.argmax(dim=-1)  # [N]
+        best_masks = low_res_masks[
+            torch.arange(N, device=self.device), best_idx
+        ]  # [N, H_low, W_low]
+        best_ious = iou_predictions[
+            torch.arange(N, device=self.device), best_idx
+        ]  # [N]
+
+        # Upscale to input resolution in one call
+        masks_upscaled = F.interpolate(
+            best_masks.unsqueeze(1),  # [N, 1, H_low, W_low]
+            size=(img_h, img_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)  # [N, H, W]
+
+        return masks_upscaled, best_ious
 
     # ── Loss computation ─────────────────────────────────────────────────
 
@@ -192,12 +271,10 @@ class SAM2Trainer:
         self, pred: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor:
         """Combined Dice + BCE loss for segmentation."""
-        # Binary cross-entropy with logits
         bce = F.binary_cross_entropy_with_logits(
             pred.float(), target.float()
         )
 
-        # Dice loss (applied to sigmoid of predictions)
         pred_sigmoid = torch.sigmoid(pred.float())
         target_f = target.float()
         intersection = (pred_sigmoid * target_f).sum()
@@ -215,45 +292,84 @@ class SAM2Trainer:
         optimizer: torch.optim.Optimizer,
         epoch: int,
     ) -> float:
-        """Train for one epoch using direct forward pass (fixed autograd)."""
+        """Train for one epoch with AMP, batched encoder, and gradient accumulation."""
         self.model.train()
+        # Keep frozen encoder in eval mode
+        if self.cfg.freeze_image_encoder:
+            self.model.image_encoder.eval()
+
         total_loss = 0.0
         n_batches = 0
+        accum_steps = self.cfg.gradient_accumulation_steps
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-        for batch in pbar:
-            images = batch["pixel_values"].to(self.device)
+        for step, batch in enumerate(pbar):
+            images = batch["pixel_values"].to(self.device, non_blocking=True)
             targets = batch["target"]
+            B = images.shape[0]
+
+            # ── Batched image encoding (all images at once) ──────────────
+            image_features = self._encode_images_batched(images)
 
             batch_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            for i in range(images.shape[0]):
-                bboxes = targets["bboxes"][i].to(self.device)
-                masks_gt = targets["masks"][i].to(self.device)
+            for i in range(B):
+                bboxes = targets["bboxes"][i].to(self.device, non_blocking=True)
+                masks_gt = targets["masks"][i].to(self.device, non_blocking=True)
 
                 if len(bboxes) == 0 or len(masks_gt) == 0:
                     continue
 
-                # FIXED: Direct forward through sub-modules, graph preserved
-                masks_pred, _ = self._forward_sam(images[i], bboxes)
+                image_embed, high_res_feats = image_features[i]
+
+                # ── AMP autocast around decoder forward + loss ───────────
+                if self._amp_dtype:
+                    with torch.autocast("cuda", dtype=self._amp_dtype):
+                        masks_pred, _ = self._forward_sam_batched(
+                            image_embed, high_res_feats, bboxes,
+                            images.shape[2], images.shape[3],
+                        )
+                else:
+                    masks_pred, _ = self._forward_sam_batched(
+                        image_embed, high_res_feats, bboxes,
+                        images.shape[2], images.shape[3],
+                    )
 
                 if len(masks_pred) == 0:
                     continue
 
-                # Match predictions to ground truth
                 n = min(len(masks_pred), len(masks_gt))
                 for j in range(n):
                     loss = self.compute_loss(masks_pred[j], masks_gt[j])
                     batch_loss = batch_loss + loss
 
+            # Scale loss for gradient accumulation
             if batch_loss.requires_grad and batch_loss > 0:
-                optimizer.zero_grad()
-                batch_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, self.model.parameters()),
-                    max_norm=1.0,
-                )
-                optimizer.step()
+                scaled_loss = batch_loss / accum_steps
+
+                if self._scaler is not None:
+                    self._scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+
+                # Step optimizer every accum_steps
+                if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
+                    if self._scaler is not None:
+                        self._scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            filter(lambda p: p.requires_grad, self.model.parameters()),
+                            max_norm=1.0,
+                        )
+                        self._scaler.step(optimizer)
+                        self._scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            filter(lambda p: p.requires_grad, self.model.parameters()),
+                            max_norm=1.0,
+                        )
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
                 total_loss += batch_loss.item()
 
             n_batches += 1
@@ -263,23 +379,38 @@ class SAM2Trainer:
 
     @torch.no_grad()
     def validate(self, dataloader: DataLoader) -> float:
-        """Compute validation loss."""
+        """Compute validation loss with AMP."""
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
 
         for batch in dataloader:
-            images = batch["pixel_values"].to(self.device)
+            images = batch["pixel_values"].to(self.device, non_blocking=True)
             targets = batch["target"]
 
+            image_features = self._encode_images_batched(images)
+
             for i in range(images.shape[0]):
-                bboxes = targets["bboxes"][i].to(self.device)
-                masks_gt = targets["masks"][i].to(self.device)
+                bboxes = targets["bboxes"][i].to(self.device, non_blocking=True)
+                masks_gt = targets["masks"][i].to(self.device, non_blocking=True)
 
                 if len(bboxes) == 0 or len(masks_gt) == 0:
                     continue
 
-                masks_pred, _ = self._forward_sam(images[i], bboxes)
+                image_embed, high_res_feats = image_features[i]
+
+                if self._amp_dtype:
+                    with torch.autocast("cuda", dtype=self._amp_dtype):
+                        masks_pred, _ = self._forward_sam_batched(
+                            image_embed, high_res_feats, bboxes,
+                            images.shape[2], images.shape[3],
+                        )
+                else:
+                    masks_pred, _ = self._forward_sam_batched(
+                        image_embed, high_res_feats, bboxes,
+                        images.shape[2], images.shape[3],
+                    )
+
                 n = min(len(masks_pred), len(masks_gt))
                 for j in range(n):
                     total_loss += self.compute_loss(masks_pred[j], masks_gt[j]).item()
@@ -311,6 +442,7 @@ class SAM2Trainer:
             num_workers=4,
             collate_fn=self._collate_fn,
             pin_memory=True,
+            prefetch_factor=2,
         )
 
         val_loader = None
@@ -322,6 +454,7 @@ class SAM2Trainer:
                 num_workers=4,
                 collate_fn=self._collate_fn,
                 pin_memory=True,
+                prefetch_factor=2,
             )
 
         optimizer = torch.optim.AdamW(
@@ -329,8 +462,19 @@ class SAM2Trainer:
             lr=self.cfg.learning_rate,
             weight_decay=self.cfg.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.cfg.num_epochs
+
+        # Cosine annealing with linear warmup
+        warmup_epochs = max(1, self.cfg.num_epochs // 10)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, total_iters=warmup_epochs
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.cfg.num_epochs - warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
         )
 
         best_val_loss = float("inf")

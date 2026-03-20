@@ -11,11 +11,9 @@ Key fixes vs. first_draft.py:
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -126,10 +124,8 @@ class Florence2Trainer:
         """
         Prepare a batch for Florence-2 training.
 
-        FIX: Labels are the *target detection output* token sequence,
-        NOT a clone of the input prompt tokens.  The input prompt is
-        ``<OPEN_VOCABULARY_DETECTION>`` and the label is the model's
-        expected output string containing location tokens + category names.
+        Uses raw PIL images from the dataset directly (no denormalize round-trip).
+        Labels are the *target detection output* token sequence.
         """
         images = []
         prompts = []
@@ -141,8 +137,6 @@ class Florence2Trainer:
             labels = target["labels"]  # list of category name strings
 
             # ── Build the target output text the model should generate ──
-            # Format: "category<loc_x1><loc_y1><loc_x2><loc_y2>"
-            # repeated for each detection in the image.
             detection_strs = []
             for bbox, label in zip(bboxes, labels):
                 loc_tokens = _bbox_coco_to_florence(
@@ -152,19 +146,20 @@ class Florence2Trainer:
 
             target_text = "".join(detection_strs) if detection_strs else ""
 
-            # ── Image: keep as raw uint8 PIL so the processor normalizes ─
-            # Instead of denormalizing the tensor, we store raw PIL at
-            # dataset level.  For compatibility with augmented tensors,
-            # convert back to uint8 PIL here.
-            img_tensor = example["pixel_values"]  # [C, H, W] normalised
-            img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
-            img_np = (
-                img_np * np.array([0.229, 0.224, 0.225])
-                + np.array([0.485, 0.456, 0.406])
-            )
-            img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
-
-            images.append(Image.fromarray(img_np))
+            # Use raw PIL image directly — no expensive denormalize round-trip
+            if "raw_image" in example:
+                images.append(example["raw_image"])
+            else:
+                # Fallback: denormalize tensor → PIL (for datasets without raw_image)
+                import numpy as np
+                img_tensor = example["pixel_values"]
+                img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+                img_np = (
+                    img_np * np.array([0.229, 0.224, 0.225])
+                    + np.array([0.485, 0.456, 0.406])
+                )
+                img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
+                images.append(Image.fromarray(img_np))
             prompts.append("<OPEN_VOCABULARY_DETECTION>")
             target_texts.append(target_text)
 
@@ -196,7 +191,7 @@ class Florence2Trainer:
     @property
     def image_size(self) -> int:
         """Shortcut to the image size used by the dataset."""
-        return 768  # Florence-2 default; overridden via config in dataset
+        return 512  # Reduced from 768; ~55% fewer vision encoder FLOPs
 
     # ── Training ─────────────────────────────────────────────────────────
 
@@ -216,8 +211,8 @@ class Florence2Trainer:
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=self.cfg.num_epochs,
-            per_device_train_batch_size=4,
-            per_device_eval_batch_size=4,
+            per_device_train_batch_size=8,
+            per_device_eval_batch_size=8,
             learning_rate=self.cfg.learning_rate,
             weight_decay=self.cfg.weight_decay,
             warmup_ratio=self.cfg.warmup_ratio,
@@ -231,6 +226,9 @@ class Florence2Trainer:
             gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
             dataloader_num_workers=4,
             dataloader_pin_memory=True,
+            dataloader_prefetch_factor=2,
+            gradient_checkpointing=True,
+            torch_compile=True,
             report_to="tensorboard",
             metric_for_best_model="eval_loss" if val_dataset else None,
             remove_unused_columns=False,

@@ -34,6 +34,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 
 from hurricane_debris.config import (
@@ -214,6 +215,11 @@ class RescueNetDataset(Dataset):
             return self._blank_sample(idx)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
+        # Keep a raw PIL copy for Florence-2 processor (avoids denormalize round-trip)
+        raw_pil = Image.fromarray(
+            cv2.resize(image, (self.image_size, self.image_size))
+        )
+
         # Load semantic mask (pixel value = class ID or official RGB colour mask)
         semantic_mask_raw = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
         if semantic_mask_raw is None:
@@ -283,6 +289,7 @@ class RescueNetDataset(Dataset):
 
         return {
             "pixel_values": image_t,
+            "raw_image": raw_pil,
             "target": target,
             "image_id": idx,
             "image_path": str(img_path),
@@ -414,6 +421,7 @@ class RescueNetDataset(Dataset):
     def _blank_sample(self, idx: int) -> Dict:
         return {
             "pixel_values": torch.zeros(3, self.image_size, self.image_size),
+            "raw_image": Image.new("RGB", (self.image_size, self.image_size)),
             "target": {
                 "bboxes": torch.zeros((0, 4), dtype=torch.float32),
                 "labels": [],
