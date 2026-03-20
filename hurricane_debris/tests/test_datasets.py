@@ -196,7 +196,7 @@ class TestDatasetSpecificSmoke:
 
             img = np.zeros((64, 64, 3), dtype=np.uint8)
             mask_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-            mask_rgb[16:48, 16:48] = (255, 0, 0)  # RescueNet official RGB for total destruction
+            mask_rgb[16:48, 16:48] = (255, 0, 0)  # RescueNet official RGB for Building-Total-Destruction
 
             cv2.imwrite(str(img_dir / "sample.png"), img)
             cv2.imwrite(

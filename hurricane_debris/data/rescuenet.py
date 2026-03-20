@@ -57,18 +57,18 @@ _SPLIT_DIRS = {
 
 # Official RescueNet RGB palette from the dataset release. OpenCV loads colour
 # images in BGR order, so masks are converted back to RGB before lookup.
-_COLOR_MASK_CLASS_IDS = OrderedDict([
-    ((0, 0, 0), 0),
-    ((61, 230, 250), 1),
-    ((180, 120, 120), 2),
-    ((235, 255, 7), 3),
-    ((255, 184, 6), 4),
-    ((255, 0, 0), 5),
-    ((255, 0, 245), 6),
-    ((140, 140, 140), 7),
-    ((160, 150, 20), 8),
-    ((4, 250, 7), 9),
-    ((255, 235, 0), 10),
+_COLOUR_MASK_CLASS_IDS = OrderedDict([
+    ((0, 0, 0), 0),        # Background
+    ((61, 230, 250), 1),   # Water
+    ((180, 120, 120), 2),  # Building-No-Damage
+    ((235, 255, 7), 3),    # Building-Minor-Damage
+    ((255, 184, 6), 4),    # Building-Major-Damage
+    ((255, 0, 0), 5),      # Building-Total-Destruction
+    ((255, 0, 245), 6),    # Vehicle
+    ((140, 140, 140), 7),  # Road-Clear
+    ((160, 150, 20), 8),   # Road-Blocked
+    ((4, 250, 7), 9),      # Tree
+    ((255, 235, 0), 10),   # Pool
 ])
 _COLOUR_MASK_ROOT_NAMES = (
     "ColorMasks-RescueNet",
@@ -293,18 +293,13 @@ class RescueNetDataset(Dataset):
         """Resolve image and mask directories for both flat and Dropbox layouts."""
         img_subdir, mask_subdir = _SPLIT_DIRS[self.split]
 
-        root_candidates = [self.root_dir]
-        rescue_root = self.root_dir / "RescueNet"
-        if rescue_root not in root_candidates:
-            root_candidates.append(rescue_root)
+        root_candidates = [self.root_dir, self.root_dir / "RescueNet"]
 
         img_dir = self._first_existing_dir(root_candidates, img_subdir)
         if img_dir is None:
             return self.root_dir / img_subdir, self.root_dir / mask_subdir
 
-        mask_candidates = list(root_candidates)
-        if self.root_dir.parent not in root_candidates:
-            mask_candidates.append(self.root_dir.parent)
+        mask_candidates = [*root_candidates, self.root_dir.parent]
         for base in tuple(mask_candidates):
             for name in _COLOUR_MASK_ROOT_NAMES:
                 candidate = base / name
@@ -342,26 +337,24 @@ class RescueNetDataset(Dataset):
             )
             return np.zeros(mask.shape[:2], dtype=np.uint8), False
 
-        rgb_mask = mask[:, :, :3][:, :, ::-1]
+        rgb_mask = mask[:, :, 2::-1]
         if np.array_equal(rgb_mask[:, :, 0], rgb_mask[:, :, 1]) and np.array_equal(
             rgb_mask[:, :, 1], rgb_mask[:, :, 2]
         ):
             return rgb_mask[:, :, 0], False
 
-        decoded = np.zeros(rgb_mask.shape[:2], dtype=np.uint8)
         flat_rgb = rgb_mask.reshape(-1, 3)
-        flat_decoded = decoded.reshape(-1)
-        unique_colors = np.unique(flat_rgb, axis=0)
+        unique_colors, inverse = np.unique(flat_rgb, axis=0, return_inverse=True)
+        color_class_ids = np.zeros(len(unique_colors), dtype=np.uint8)
         unknown_colors = []
 
-        for color in unique_colors:
+        for idx, color in enumerate(unique_colors):
             color_tuple = tuple(int(v) for v in color)
-            class_id = _COLOR_MASK_CLASS_IDS.get(color_tuple)
+            class_id = _COLOUR_MASK_CLASS_IDS.get(color_tuple)
             if class_id is None:
                 unknown_colors.append(color_tuple)
                 continue
-            matches = np.all(flat_rgb == color, axis=1)
-            flat_decoded[matches] = class_id
+            color_class_ids[idx] = class_id
 
         if unknown_colors:
             logger.warning(
@@ -372,6 +365,7 @@ class RescueNetDataset(Dataset):
                 unknown_colors[:5],
             )
 
+        decoded = color_class_ids[inverse].reshape(rgb_mask.shape[:2])
         return decoded, True
 
     def _mask_to_instances(

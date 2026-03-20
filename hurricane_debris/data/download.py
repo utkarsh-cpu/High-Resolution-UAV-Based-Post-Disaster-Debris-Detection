@@ -79,7 +79,7 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         manual_instructions=(
             "1. Register at https://ieee-dataport.org/open-access/rescuenet\n"
             "2. Download the RescueNet imagery plus the optional "
-            "ColorMasks-RescueNet / colourmask-rescuenet archive from the official mirrors.\n"
+            "ColorMasks-RescueNet / colormask-rescuenet archive from the official mirrors.\n"
             "3. Either extract into  <dataset-dir>/rescuenet/  so that the layout is:\n"
             "     rescuenet/\n"
             "       train/train-org-img/\n"
@@ -485,7 +485,10 @@ def verify_dataset(name: str, dataset_dir: str) -> bool:
     info = DATASET_REGISTRY[name]
     path = Path(dataset_dir)
     if name == "rescuenet":
-        valid = _resolve_existing_rescuenet_dir(path.parent, path) is not None or _resolve_existing_rescuenet_dir(path, path / name) is not None
+        valid_root = _resolve_existing_rescuenet_dir(path.parent, path)
+        if valid_root is None:
+            valid_root = _resolve_existing_rescuenet_dir(path, path / name)
+        valid = valid_root is not None
     else:
         valid = _validate_dataset_dir(path, info.expected_dirs)
     if valid:
