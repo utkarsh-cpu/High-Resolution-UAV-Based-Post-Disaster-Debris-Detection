@@ -5,20 +5,29 @@ Alam et al., IEEE TGRS 2022.
 4,494 images at 0.5–2 cm/px GSD from Hurricane Michael (FL, 2018).
 8-class pixel-level semantic segmentation with official train/val/test splits.
 
-Expected directory layout (after download):
+Supported directory layouts (after download):
     datasets/rescuenet/
     ├── train/
     │   ├── train-org-img/      # RGB images
-    │   └── train-label-img/    # Semantic masks (pixel value = class ID)
+    │   └── train-label-img/    # Semantic masks (class-ID or official colour mask)
     ├── val/
     │   ├── val-org-img/
     │   └── val-label-img/
     └── test/
         ├── test-org-img/
         └── test-label-img/
+
+or the Dropbox layout where imagery and colour masks are extracted as sibling
+directories:
+    datasets/
+    ├── RescueNet/
+    │   └── {train,val,test}/{...}-org-img/
+    └── ColorMasks-RescueNet/
+        └── {train,val,test}/{...}-label-img/
 """
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -31,6 +40,7 @@ from hurricane_debris.config import (
     CATEGORY_QUERIES,
     DEBRIS_CATEGORIES,
     RESCUENET_CLASS_MAP,
+    RESCUENET_OFFICIAL_CLASS_MAP,
     DataConfig,
 )
 from hurricane_debris.data.transforms import get_train_transforms, get_val_transforms
@@ -44,6 +54,30 @@ _SPLIT_DIRS = {
     "val": ("val/val-org-img", "val/val-label-img"),
     "test": ("test/test-org-img", "test/test-label-img"),
 }
+
+# Official RescueNet RGB palette from the dataset release. OpenCV loads colour
+# images in BGR order, so masks are converted back to RGB before lookup.
+_COLOUR_MASK_CLASS_IDS = OrderedDict([
+    ((0, 0, 0), 0),        # Background
+    ((61, 230, 250), 1),   # Water
+    ((180, 120, 120), 2),  # Building-No-Damage
+    ((235, 255, 7), 3),    # Building-Minor-Damage
+    ((255, 184, 6), 4),    # Building-Major-Damage
+    ((255, 0, 0), 5),      # Building-Total-Destruction
+    ((255, 0, 245), 6),    # Vehicle
+    ((140, 140, 140), 7),  # Road-Clear
+    ((160, 150, 20), 8),   # Road-Blocked
+    ((4, 250, 7), 9),      # Tree
+    ((255, 235, 0), 10),   # Pool
+])
+_COLOUR_MASK_ROOT_NAMES = (
+    "ColorMasks-RescueNet",
+    "ColourMasks-RescueNet",
+    "colormasks-rescuenet",
+    "colourmasks-rescuenet",
+    "colormask-rescuenet",
+    "colourmask-rescuenet",
+)
 
 
 class RescueNetDataset(Dataset):
@@ -82,7 +116,9 @@ class RescueNetDataset(Dataset):
     ):
         """
         Args:
-            root_dir: Path to rescuenet/ directory.
+            root_dir: Path to the RescueNet dataset root, or to a parent
+                      directory containing sibling ``RescueNet/`` and
+                      ``ColorMasks-RescueNet/`` folders from Dropbox.
             split: One of "train", "val", "test".
             config: Data configuration.
             task: "detection", "segmentation", or "combined".
@@ -99,14 +135,12 @@ class RescueNetDataset(Dataset):
         if split not in _SPLIT_DIRS:
             raise ValueError(f"split must be one of {list(_SPLIT_DIRS)}, got '{split}'")
 
-        img_subdir, mask_subdir = _SPLIT_DIRS[split]
-        self.img_dir = self.root_dir / img_subdir
-        self.mask_dir = self.root_dir / mask_subdir
+        self.img_dir, self.mask_dir = self._resolve_split_dirs()
 
         if not self.img_dir.exists():
             raise FileNotFoundError(
                 f"Image directory not found: {self.img_dir}. "
-                "Please download RescueNet and extract it following the expected layout."
+                "Please download RescueNet and extract it following one of the supported layouts."
             )
 
         # Gather paired image/mask paths
@@ -166,14 +200,20 @@ class RescueNetDataset(Dataset):
             return self._blank_sample(idx)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Load semantic mask (pixel value = class ID)
-        semantic_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if semantic_mask is None:
+        # Load semantic mask (pixel value = class ID or official RGB colour mask)
+        semantic_mask_raw = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+        if semantic_mask_raw is None:
             logger.warning("Cannot read mask: %s", mask_path)
             return self._blank_sample(idx)
+        semantic_mask, use_official_map = self._decode_semantic_mask(
+            semantic_mask_raw, mask_path
+        )
 
         # Remap classes through the unified taxonomy
-        semantic_mask = self._remap_classes(semantic_mask)
+        semantic_mask = self._remap_classes(
+            semantic_mask,
+            official_release=use_official_map,
+        )
 
         # Derive per-instance bboxes + masks from connected components
         bboxes, category_ids, instance_masks = self._mask_to_instances(
@@ -241,12 +281,92 @@ class RescueNetDataset(Dataset):
     # ── Helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
-    def _remap_classes(mask: np.ndarray) -> np.ndarray:
+    def _remap_classes(mask: np.ndarray, official_release: bool = False) -> np.ndarray:
         """Remap RescueNet class IDs through the unified taxonomy."""
         out = np.zeros_like(mask)
-        for src, dst in RESCUENET_CLASS_MAP.items():
+        class_map = RESCUENET_OFFICIAL_CLASS_MAP if official_release else RESCUENET_CLASS_MAP
+        for src, dst in class_map.items():
             out[mask == src] = dst
         return out
+
+    def _resolve_split_dirs(self) -> Tuple[Path, Path]:
+        """Resolve image and mask directories for both flat and Dropbox layouts."""
+        img_subdir, mask_subdir = _SPLIT_DIRS[self.split]
+
+        root_candidates = [self.root_dir, self.root_dir / "RescueNet"]
+
+        img_dir = self._first_existing_dir(root_candidates, img_subdir)
+        if img_dir is None:
+            return self.root_dir / img_subdir, self.root_dir / mask_subdir
+
+        mask_candidates = [*root_candidates, self.root_dir.parent]
+        for base in tuple(mask_candidates):
+            for name in _COLOUR_MASK_ROOT_NAMES:
+                candidate = base / name
+                if candidate not in mask_candidates:
+                    mask_candidates.append(candidate)
+
+        mask_dir = self._first_existing_dir(mask_candidates, mask_subdir)
+        if mask_dir is None:
+            mask_dir = img_dir.parent / Path(mask_subdir).name
+
+        return img_dir, mask_dir
+
+    @staticmethod
+    def _first_existing_dir(roots: List[Path], subdir: str) -> Optional[Path]:
+        for root in roots:
+            candidate = root / subdir
+            if candidate.exists():
+                return candidate
+        return None
+
+    @staticmethod
+    def _decode_semantic_mask(mask: np.ndarray, mask_path: Path) -> Tuple[np.ndarray, bool]:
+        """Decode grayscale class-ID masks and official RescueNet colour masks."""
+        if mask.ndim == 2:
+            return mask, False
+
+        if mask.ndim == 3 and mask.shape[2] == 1:
+            return mask[:, :, 0], False
+
+        if mask.ndim != 3 or mask.shape[2] < 3:
+            logger.warning(
+                "Unexpected RescueNet mask shape for %s: %s",
+                mask_path,
+                getattr(mask, "shape", None),
+            )
+            return np.zeros(mask.shape[:2], dtype=np.uint8), False
+
+        rgb_mask = mask[:, :, 2::-1]
+        if np.array_equal(rgb_mask[:, :, 0], rgb_mask[:, :, 1]) and np.array_equal(
+            rgb_mask[:, :, 1], rgb_mask[:, :, 2]
+        ):
+            return rgb_mask[:, :, 0], False
+
+        flat_rgb = rgb_mask.reshape(-1, 3)
+        unique_colors, inverse = np.unique(flat_rgb, axis=0, return_inverse=True)
+        color_class_ids = np.zeros(len(unique_colors), dtype=np.uint8)
+        unknown_colors = []
+
+        for idx, color in enumerate(unique_colors):
+            color_tuple = tuple(int(v) for v in color)
+            class_id = _COLOUR_MASK_CLASS_IDS.get(color_tuple)
+            if class_id is None:
+                unknown_colors.append(color_tuple)
+                continue
+            color_class_ids[idx] = class_id
+
+        if unknown_colors:
+            logger.warning(
+                "Found %d unknown colours in RescueNet mask %s; treating them as background. "
+                "Examples: %s",
+                len(unknown_colors),
+                mask_path,
+                unknown_colors[:5],
+            )
+
+        decoded = color_class_ids[inverse].reshape(rgb_mask.shape[:2])
+        return decoded, True
 
     def _mask_to_instances(
         self, semantic_mask: np.ndarray, img_w: int, img_h: int

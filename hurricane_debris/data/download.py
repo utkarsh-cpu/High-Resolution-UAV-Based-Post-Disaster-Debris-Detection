@@ -78,15 +78,20 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         expected_dirs=["train", "val", "test"],
         manual_instructions=(
             "1. Register at https://ieee-dataport.org/open-access/rescuenet\n"
-            "2. Download all split archives (train / val / test).\n"
-            "3. Extract into  <dataset-dir>/rescuenet/  so that the layout is:\n"
+            "2. Download the RescueNet imagery plus the optional "
+            "ColorMasks-RescueNet / colormask-rescuenet archive from the official mirrors.\n"
+            "3. Either extract into  <dataset-dir>/rescuenet/  so that the layout is:\n"
             "     rescuenet/\n"
             "       train/train-org-img/\n"
             "       train/train-label-img/\n"
             "       val/val-org-img/\n"
             "       val/val-label-img/\n"
             "       test/test-org-img/\n"
-            "       test/test-label-img/"
+            "       test/test-label-img/\n"
+            "   or keep the Dropbox layout as sibling folders:\n"
+            "     <dataset-dir>/RescueNet/\n"
+            "     <dataset-dir>/ColorMasks-RescueNet/\n"
+            "   The RescueNet loader supports both layouts."
         ),
     ),
     "msnet": DatasetInfo(
@@ -135,6 +140,14 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         ),
     ),
 }
+_RESCUENET_COLOURMASK_ROOTS = (
+    "ColorMasks-RescueNet",
+    "ColourMasks-RescueNet",
+    "colormasks-rescuenet",
+    "colourmasks-rescuenet",
+    "colormask-rescuenet",
+    "colourmask-rescuenet",
+)
 
 # ── Progress hook for urllib.urlretrieve ─────────────────────────────────────
 
@@ -203,6 +216,36 @@ def _validate_dataset_dir(dest_dir: Path, expected_dirs: List[str]) -> bool:
         if not (dest_dir / sub).exists():
             return False
     return True
+
+
+def _first_existing_child(base_dir: Path, names: List[str]) -> Optional[Path]:
+    for name in names:
+        candidate = base_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_existing_rescuenet_dir(dest_root: Path, dataset_dir: Path) -> Optional[Path]:
+    """Return an existing RescueNet root for flat or Dropbox layouts."""
+    if _validate_dataset_dir(dataset_dir, DATASET_REGISTRY["rescuenet"].expected_dirs):
+        return dataset_dir
+
+    if _validate_dataset_dir(dest_root / "RescueNet", DATASET_REGISTRY["rescuenet"].expected_dirs):
+        colourmask_root = _first_existing_child(dest_root, list(_RESCUENET_COLOURMASK_ROOTS))
+        if colourmask_root is not None and _validate_dataset_dir(
+            colourmask_root, DATASET_REGISTRY["rescuenet"].expected_dirs
+        ):
+            return dest_root / "RescueNet"
+
+    if _validate_dataset_dir(dataset_dir / "RescueNet", DATASET_REGISTRY["rescuenet"].expected_dirs):
+        colourmask_root = _first_existing_child(dataset_dir, list(_RESCUENET_COLOURMASK_ROOTS))
+        if colourmask_root is not None and _validate_dataset_dir(
+            colourmask_root, DATASET_REGISTRY["rescuenet"].expected_dirs
+        ):
+            return dataset_dir / "RescueNet"
+
+    return None
 
 
 # ── Per-dataset download implementations ─────────────────────────────────────
@@ -327,6 +370,15 @@ def download_dataset(
     dataset_dir = dest_root / name
 
     # ── Already exists? ──────────────────────────────────────────────────
+    if not force and name == "rescuenet":
+        existing_rescuenet = _resolve_existing_rescuenet_dir(dest_root, dataset_dir)
+        if existing_rescuenet is not None:
+            logger.info(
+                "Dataset '%s' already present at %s – skipping download.",
+                name, existing_rescuenet,
+            )
+            return existing_rescuenet
+
     if not force and _validate_dataset_dir(dataset_dir, info.expected_dirs):
         logger.info(
             "Dataset '%s' already present at %s – skipping download.",
@@ -432,7 +484,13 @@ def verify_dataset(name: str, dataset_dir: str) -> bool:
         raise ValueError(f"Unknown dataset '{name}'")
     info = DATASET_REGISTRY[name]
     path = Path(dataset_dir)
-    valid = _validate_dataset_dir(path, info.expected_dirs)
+    if name == "rescuenet":
+        valid_root = _resolve_existing_rescuenet_dir(path.parent, path)
+        if valid_root is None:
+            valid_root = _resolve_existing_rescuenet_dir(path, path / name)
+        valid = valid_root is not None
+    else:
+        valid = _validate_dataset_dir(path, info.expected_dirs)
     if valid:
         logger.info("✓ %s: directory structure looks valid at %s", name, path)
     else:

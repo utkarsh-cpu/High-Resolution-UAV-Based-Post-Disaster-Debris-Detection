@@ -186,6 +186,31 @@ class TestDatasetSpecificSmoke:
             assert "image_path" in sample
             assert sample["target"]["bboxes"].shape[1] == 4
 
+    def test_rescuenet_loader_supports_dropbox_colourmask_layout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            img_dir = root / "RescueNet" / "test" / "test-org-img"
+            mask_dir = root / "ColorMasks-RescueNet" / "test" / "test-label-img"
+            img_dir.mkdir(parents=True)
+            mask_dir.mkdir(parents=True)
+
+            img = np.zeros((64, 64, 3), dtype=np.uint8)
+            mask_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+            mask_rgb[16:48, 16:48] = (255, 0, 0)  # RescueNet official RGB for Building-Total-Destruction
+
+            cv2.imwrite(str(img_dir / "sample.png"), img)
+            cv2.imwrite(
+                str(mask_dir / "sample.png"),
+                cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR),
+            )
+
+            ds = RescueNetDataset(root_dir=str(root), split="test", config=DataConfig(image_size=64))
+            assert len(ds) == 1
+            sample = ds[0]
+            assert "image_path" in sample
+            assert sample["target"]["bboxes"].shape[0] == 1
+            assert sample["target"]["category_ids"].tolist() == [3]
+
     def test_designsafe_loader_smoke(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

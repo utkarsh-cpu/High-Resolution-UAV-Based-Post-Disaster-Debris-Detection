@@ -68,6 +68,17 @@ The project supports the following datasets:
 Before training, download the required datasets. The built-in pipeline handles
 download, extraction, and directory-layout validation.
 
+For **RescueNet**, the official Dropbox share includes separate `RescueNet/`
+imagery and `ColorMasks-RescueNet/` colour-mask folders. This repository now
+supports both:
+
+- the original flattened layout under one dataset root, and
+- the Dropbox layout where `RescueNet/` and `ColorMasks-RescueNet/` sit side by
+  side.
+
+If you keep the Dropbox layout, point `--dataset-dir` either at the parent
+folder containing both directories, or directly at `RescueNet/`.
+
 ```bash
 # Download RescueNet (primary training/evaluation dataset)
 python main.py --download --dataset rescuenet --dataset-dir ./datasets
@@ -91,6 +102,8 @@ python main.py --download --dataset rescuenet --dataset-dir ./datasets --keep-ar
 > **Note:** Some datasets, especially MSNet and DesignSafe-CI, may require
 > registration or manual access approval. When automatic download is not
 > available, the CLI prints instructions for manual acquisition.
+> RescueNet colour masks from `ColorMasks-RescueNet` / `colourmask-rescuenet`
+> are auto-decoded by the RescueNet loader.
 
 ## Quick Start
 

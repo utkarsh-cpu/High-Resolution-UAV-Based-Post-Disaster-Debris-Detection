@@ -100,6 +100,11 @@ class TestDatasetRegistry:
                 f"{info.name}: manual_instructions should not be empty"
             )
 
+    def test_rescuenet_manual_instructions_cover_colourmask_dropbox_layout(self):
+        instructions = DATASET_REGISTRY["rescuenet"].manual_instructions
+        assert "ColorMasks-RescueNet" in instructions
+        assert "RescueNet/" in instructions
+
 
 # ── Validation helpers ────────────────────────────────────────────────────────
 
@@ -184,6 +189,17 @@ class TestDownloadDataset:
         # No actual download should happen – gdown / URL should not be called
         result = download_dataset("rescuenet", dest_dir=str(tmp_dir))
         assert result == ds_dir
+
+    def test_skips_download_for_dropbox_rescuenet_colourmask_layout(self, tmp_dir):
+        info = DATASET_REGISTRY["rescuenet"]
+        image_root = tmp_dir / "RescueNet"
+        mask_root = tmp_dir / "ColorMasks-RescueNet"
+        for sub in info.expected_dirs:
+            (image_root / sub).mkdir(parents=True)
+            (mask_root / sub).mkdir(parents=True)
+
+        result = download_dataset("rescuenet", dest_dir=str(tmp_dir))
+        assert result == image_root
 
     def test_force_retriggers_download_attempt(self, tmp_dir):
         """With force=True, download is attempted even if data exists."""
@@ -275,6 +291,14 @@ class TestVerifyDataset:
         ds_dir = tmp_dir / "rescuenet"
         ds_dir.mkdir()
         assert verify_dataset("rescuenet", str(ds_dir)) is False
+
+    def test_returns_true_for_dropbox_rescuenet_colourmask_layout(self, tmp_dir):
+        info = DATASET_REGISTRY["rescuenet"]
+        for sub in info.expected_dirs:
+            (tmp_dir / "RescueNet" / sub).mkdir(parents=True)
+            (tmp_dir / "ColorMasks-RescueNet" / sub).mkdir(parents=True)
+
+        assert verify_dataset("rescuenet", str(tmp_dir)) is True
 
     def test_raises_on_unknown_dataset(self, tmp_dir):
         with pytest.raises(ValueError, match="Unknown dataset"):

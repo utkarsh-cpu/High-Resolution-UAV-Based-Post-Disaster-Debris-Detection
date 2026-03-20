@@ -44,6 +44,22 @@ RESCUENET_CLASS_MAP = {
     7: 7,  # Vehicle → vehicle
 }
 
+# Official RescueNet 11-class release (including the ColorMasks-RescueNet
+# archive) → project-wide unified 8-class taxonomy
+RESCUENET_OFFICIAL_CLASS_MAP = {
+    0: 0,   # Background → background
+    1: 1,   # Water → water
+    2: 2,   # Building-No-Damage → building_no_damage
+    3: 3,   # Building-Minor-Damage → building_damaged
+    4: 3,   # Building-Major-Damage → building_damaged
+    5: 3,   # Building-Total-Destruction → building_damaged
+    6: 7,   # Vehicle → vehicle
+    7: 5,   # Road-Clear → road_no_damage
+    8: 6,   # Road-Blocked → road_damaged
+    9: 4,   # Tree → vegetation
+    10: 1,  # Pool → water
+}
+
 # MSNet damage level mapping → unified taxonomy (coarser)
 MSNET_DAMAGE_MAP = {
     0: 0,  # No damage → background
