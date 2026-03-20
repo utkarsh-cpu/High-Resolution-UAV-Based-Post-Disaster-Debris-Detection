@@ -172,16 +172,14 @@ class Florence2Trainer:
         ).to(self.device)
 
         # ── Tokenize targets (detection output text) ─────────────────────
-        # This is the KEY FIX: labels are the tokenized *output* sequence,
-        # not a copy of the input prompt.
-        with self.processor.as_target_processor():
-            label_encoding = self.processor.tokenizer(
-                target_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=self.cfg.max_new_tokens,
-            )
+        # Labels are the tokenized *output* sequence.
+        label_encoding = self.processor.tokenizer(
+            target_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.cfg.max_new_tokens,
+        )
 
         labels = label_encoding["input_ids"].to(self.device)
         # Mask padding tokens with -100 so they're ignored in the loss
