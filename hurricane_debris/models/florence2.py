@@ -95,8 +95,13 @@ class Florence2Trainer:
         logger.info("Loading Florence-2 base model: %s", self.cfg.model_id)
 
         self.processor = load_florence_processor(self.cfg.model_id)
+        # Half-precision on CUDA (2x memory saving vs float32)
+        if self.device == "cuda":
+            _dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            _dtype = torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.cfg.model_id, torch_dtype=torch.float32, trust_remote_code=True
+            self.cfg.model_id, torch_dtype=_dtype, trust_remote_code=True
         ).to(self.device)
 
     def setup_lora(self):
@@ -205,6 +210,9 @@ class Florence2Trainer:
         output_dir = output_dir or self.cfg.output_dir
         logger.info("Starting Florence-2 training for %d epochs", self.cfg.num_epochs)
 
+        _use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        _use_fp16 = torch.cuda.is_available() and not _use_bf16
+
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=self.cfg.num_epochs,
@@ -218,8 +226,11 @@ class Florence2Trainer:
             eval_strategy="epoch" if val_dataset else "no",
             save_total_limit=3,
             load_best_model_at_end=val_dataset is not None,
-            fp16=torch.cuda.is_available(),
+            bf16=_use_bf16,
+            fp16=_use_fp16,
             gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
+            dataloader_num_workers=4,
+            dataloader_pin_memory=True,
             report_to="tensorboard",
             metric_for_best_model="eval_loss" if val_dataset else None,
             remove_unused_columns=False,
