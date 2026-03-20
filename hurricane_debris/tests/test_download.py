@@ -280,6 +280,71 @@ class TestDownloadDataset:
         mock_try_download.assert_not_called()
         assert not archive_path.exists()
 
+    def test_uses_split_rescuenet_archives_in_destination_without_redownloading(self, tmp_dir):
+        """Official RescueNet image and mask archives should be extracted together."""
+        dest_dir = tmp_dir / "datasets"
+        image_archive = _make_zip(
+            dest_dir / "RescueNet.zip",
+            {
+                "RescueNet/train/.keep": "",
+                "RescueNet/val/.keep": "",
+                "RescueNet/test/.keep": "",
+            },
+        )
+        mask_archive = _make_zip(
+            dest_dir / "ColorMasks-RescueNet.zip",
+            {
+                "ColorMasks-RescueNet/train/.keep": "",
+                "ColorMasks-RescueNet/val/.keep": "",
+                "ColorMasks-RescueNet/test/.keep": "",
+            },
+        )
+
+        with patch.object(_dl, "_try_download") as mock_try_download:
+            result = download_dataset("rescuenet", dest_dir=str(dest_dir))
+
+        assert result == dest_dir / "RescueNet"
+        for sub in DATASET_REGISTRY["rescuenet"].expected_dirs:
+            assert (dest_dir / "RescueNet" / sub).exists()
+            assert (dest_dir / "ColorMasks-RescueNet" / sub).exists()
+        mock_try_download.assert_not_called()
+        assert not image_archive.exists()
+        assert not mask_archive.exists()
+
+    def test_uses_alternate_msnet_archive_name_in_destination(self, tmp_dir):
+        """The official ISBDA archive name should be recognized for MSNet."""
+        dest_dir = tmp_dir / "datasets"
+        archive_path = _make_zip(
+            dest_dir / "ISBDA.zip",
+            {"images/.keep": "", "annotations/instances_train.json": "{}"},
+        )
+
+        with patch.object(_dl, "_try_download") as mock_try_download:
+            result = download_dataset("msnet", dest_dir=str(dest_dir))
+
+        assert result == dest_dir / "msnet"
+        assert (result / "images").exists()
+        assert (result / "annotations").exists()
+        mock_try_download.assert_not_called()
+        assert not archive_path.exists()
+
+    def test_uses_alternate_designsafe_archive_name_in_destination(self, tmp_dir):
+        """The official PRJ-6029 archive name should be recognized for DesignSafe."""
+        dest_dir = tmp_dir / "datasets"
+        archive_path = _make_zip(
+            dest_dir / "PRJ-6029.zip",
+            {"images/.keep": "", "annotations/damage_observations.json": "{}"},
+        )
+
+        with patch.object(_dl, "_try_download") as mock_try_download:
+            result = download_dataset("designsafe", dest_dir=str(dest_dir))
+
+        assert result == dest_dir / "designsafe"
+        assert (result / "images").exists()
+        assert (result / "annotations").exists()
+        mock_try_download.assert_not_called()
+        assert not archive_path.exists()
+
     def test_download_all_dispatches_to_each_dataset(self, tmp_dir):
         """--dataset all should invoke download for every registered dataset."""
         # Pre-create expected dirs to satisfy the "already exists" check

@@ -41,6 +41,8 @@ from urllib.request import urlretrieve
 from hurricane_debris.utils.logging import get_logger
 
 logger = get_logger("data.download")
+_LAYOUT_DEFAULT = "default"
+_LAYOUT_RESCUENET = "rescuenet"
 
 # ── Dataset registry ──────────────────────────────────────────────────────────
 
@@ -55,6 +57,18 @@ class DatasetInfo:
     gdrive_id: Optional[str] = None
     url: Optional[str] = None
     archive_name: str = "archive.zip"
+    #: Alternate single local archive names accepted for manual placement.
+    #: These are one-file alternatives checked after `archive_name`.
+    #: Example: MSNet accepts either `msnet.zip` or `ISBDA.zip`.
+    local_archive_names: List[str] = field(default_factory=list)
+    #: A complete set of local archives that must all be present together.
+    #: Unlike `local_archive_names`, every archive in this bundle must exist.
+    #: Example: RescueNet uses `RescueNet.zip` plus `ColorMasks-RescueNet.zip`.
+    local_archive_bundle: List[str] = field(default_factory=list)
+    #: When True, extract a found archive bundle into the dataset root folder.
+    extract_bundle_into_root: bool = False
+    #: Dataset layout resolver key used for pre/post-extraction validation.
+    existing_dir_layout: str = _LAYOUT_DEFAULT
     #: Expected top-level subdirectories after extraction
     expected_dirs: List[str] = field(default_factory=list)
     #: Human-readable instructions when automated download is unavailable
@@ -75,6 +89,9 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         # Set to None if the link expires; supply --url or use manual download.
         gdrive_id="1alu8k9WuYFoMizuBxGpLYsS5S9rCUHJP",
         archive_name="rescuenet.zip",
+        local_archive_bundle=["RescueNet.zip", "ColorMasks-RescueNet.zip"],
+        extract_bundle_into_root=True,
+        existing_dir_layout=_LAYOUT_RESCUENET,
         expected_dirs=["train", "val", "test"],
         manual_instructions=(
             "1. Register at https://ieee-dataport.org/open-access/rescuenet\n"
@@ -103,6 +120,7 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         gdrive_id=None,
         url=None,
         archive_name="msnet.zip",
+        local_archive_names=["ISBDA.zip"],
         expected_dirs=["images", "annotations"],
         manual_instructions=(
             "1. Visit the xBD dataset page or the MSNet repository:\n"
@@ -127,6 +145,7 @@ DATASET_REGISTRY: Dict[str, DatasetInfo] = {
         gdrive_id=None,
         url=None,
         archive_name="designsafe.zip",
+        local_archive_names=["PRJ-6029.zip"],
         expected_dirs=["images", "annotations"],
         manual_instructions=(
             "The DesignSafe-CI dataset requires a free account.\n"
@@ -324,6 +343,48 @@ def _has_existing_archive(archive_path: Path) -> bool:
     return False
 
 
+def _find_local_archives(info: DatasetInfo, dest_root: Path) -> List[Path]:
+    """Return matching local archive(s) for a dataset, if present."""
+    if info.local_archive_bundle:
+        split_archives = [dest_root / archive_name for archive_name in info.local_archive_bundle]
+        if all(path.is_file() for path in split_archives):
+            logger.info(
+                "Found complete local archive bundle for '%s'; preferring bundle extraction.",
+                info.name,
+            )
+            for path in split_archives:
+                logger.info("Found existing archive at %s", path)
+            return split_archives
+
+    for archive_name in [info.archive_name, *info.local_archive_names]:
+        archive_path = dest_root / archive_name
+        if _has_existing_archive(archive_path):
+            return [archive_path]
+
+    return []
+
+
+def _resolve_existing_dataset_dir(
+    info: DatasetInfo,
+    dest_root: Path,
+    dataset_dir: Path,
+) -> Optional[Path]:
+    """Return an existing dataset directory for the configured layout."""
+    if info.existing_dir_layout == _LAYOUT_RESCUENET:
+        return _resolve_existing_rescuenet_dir(dest_root, dataset_dir)
+    if _validate_dataset_dir(dataset_dir, info.expected_dirs):
+        return dataset_dir
+    return None
+
+
+def _uses_local_archive_bundle(info: DatasetInfo, local_archives: List[Path]) -> bool:
+    """Return True when *local_archives* matches the configured archive bundle."""
+    if not info.local_archive_bundle:
+        return False
+    archive_names = {path.name for path in local_archives}
+    return archive_names == set(info.local_archive_bundle)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def download_dataset(
@@ -378,21 +439,14 @@ def download_dataset(
     dataset_dir = dest_root / name
 
     # ── Already exists? ──────────────────────────────────────────────────
-    if not force and name == "rescuenet":
-        existing_rescuenet = _resolve_existing_rescuenet_dir(dest_root, dataset_dir)
-        if existing_rescuenet is not None:
+    if not force:
+        existing_dataset_dir = _resolve_existing_dataset_dir(info, dest_root, dataset_dir)
+        if existing_dataset_dir is not None:
             logger.info(
                 "Dataset '%s' already present at %s – skipping download.",
-                name, existing_rescuenet,
+                name, existing_dataset_dir,
             )
-            return existing_rescuenet
-
-    if not force and _validate_dataset_dir(dataset_dir, info.expected_dirs):
-        logger.info(
-            "Dataset '%s' already present at %s – skipping download.",
-            name, dataset_dir,
-        )
-        return dataset_dir
+            return existing_dataset_dir
 
     logger.info("=" * 60)
     logger.info("Dataset: %s", info.name.upper())
@@ -404,14 +458,22 @@ def download_dataset(
 
     # ── Download ─────────────────────────────────────────────────────────
     archive_path = dest_root / info.archive_name
-    if _has_existing_archive(archive_path):
+    local_archives = _find_local_archives(info, dest_root)
+    if local_archives:
         logger.info(
-            "Using existing archive for '%s' instead of downloading again.",
+            "Using existing local archive(s) for '%s' instead of downloading again.",
             name,
         )
         archive_ready = True
+        extract_root = (
+            dest_root
+            if info.extract_bundle_into_root and _uses_local_archive_bundle(info, local_archives)
+            else dataset_dir
+        )
     else:
         archive_ready = _try_download(info, archive_path)
+        local_archives = [archive_path]
+        extract_root = dataset_dir
 
     if not archive_ready:
         _print_manual_instructions(info)
@@ -421,21 +483,28 @@ def download_dataset(
         )
 
     # ── Extract ──────────────────────────────────────────────────────────
-    _extract_archive(archive_path, dataset_dir)
+    for current_archive in local_archives:
+        _extract_archive(current_archive, extract_root)
 
     # After extraction the archive may have created a single top-level
     # directory.  Flatten it if needed so that expected_dirs are direct
     # children of dataset_dir.
-    _flatten_single_subdir(dataset_dir)
+    if extract_root == dataset_dir:
+        _flatten_single_subdir(dataset_dir)
+    # Bundles extracted into dest_root intentionally keep their sibling layout
+    # (for example RescueNet/ plus ColorMasks-RescueNet/).
 
     if not keep_archive:
-        archive_path.unlink(missing_ok=True)
-        logger.info("Archive removed: %s", archive_path)
+        for current_archive in local_archives:
+            current_archive.unlink(missing_ok=True)
+            logger.info("Archive removed: %s", current_archive)
 
     # ── Validate ─────────────────────────────────────────────────────────
-    if _validate_dataset_dir(dataset_dir, info.expected_dirs):
+    resolved_dataset_dir = _resolve_existing_dataset_dir(info, dest_root, dataset_dir)
+
+    if resolved_dataset_dir is not None:
         logger.info(
-            "✓ Dataset '%s' ready at %s", name, dataset_dir
+            "✓ Dataset '%s' ready at %s", name, resolved_dataset_dir
         )
     else:
         missing = [
@@ -449,7 +518,9 @@ def download_dataset(
             missing,
         )
 
-    return dataset_dir
+    # Fall back to dataset_dir for callers that want to inspect a partially
+    # extracted dataset after the warning above.
+    return resolved_dataset_dir or dataset_dir
 
 
 def _flatten_single_subdir(dest_dir: Path) -> None:
