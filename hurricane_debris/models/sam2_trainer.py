@@ -241,9 +241,23 @@ class SAM2Trainer:
 
         # Expand image embedding to match N prompts
         image_embed_expanded = image_embed.expand(N, -1, -1, -1)
-        high_res_expanded = [
-            hr.expand(N, -1, -1, -1) for hr in high_res_feats
-        ] if high_res_feats else None
+
+        # Project high-res features through the conv_s0/conv_s1 layers
+        # (256-ch → 32-ch and 64-ch) that SAM2Base normally applies in
+        # _forward_sam_heads before calling the mask decoder.
+        if high_res_feats and len(high_res_feats) == 2:
+            decoder = self.model.sam_mask_decoder
+            if hasattr(decoder, 'conv_s0') and hasattr(decoder, 'conv_s1'):
+                high_res_projected = [
+                    decoder.conv_s0(high_res_feats[0]).expand(N, -1, -1, -1),
+                    decoder.conv_s1(high_res_feats[1]).expand(N, -1, -1, -1),
+                ]
+            else:
+                high_res_projected = [
+                    hr.expand(N, -1, -1, -1) for hr in high_res_feats
+                ]
+        else:
+            high_res_projected = None
 
         # Mask decoder — all prompts in one call
         low_res_masks, iou_predictions = self.model.sam_mask_decoder(
@@ -253,7 +267,7 @@ class SAM2Trainer:
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=self.cfg.multimask_output,
             repeat_image=False,
-            high_res_features=high_res_expanded,
+            high_res_features=high_res_projected,
         )
 
         # Select best mask per prompt by predicted IoU
