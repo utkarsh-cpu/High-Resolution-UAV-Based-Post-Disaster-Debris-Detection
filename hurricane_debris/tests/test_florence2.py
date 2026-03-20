@@ -3,15 +3,59 @@ Unit tests for Florence-2 label generation.
 These are fast tests that do NOT load the actual model.
 """
 
+from contextlib import contextmanager
+
 import numpy as np
 import pytest
 import torch
-from contextlib import contextmanager
 
-from hurricane_debris.models.florence2 import Florence2Trainer, _bbox_coco_to_florence
+from hurricane_debris.models import florence2 as florence2_module
+from hurricane_debris.models.florence2 import (
+    Florence2Trainer,
+    _bbox_coco_to_florence,
+    load_florence_processor,
+)
 
 
 class TestFlorence2Labels:
+
+    def test_load_florence_processor_retries_with_slow_tokenizer(self, monkeypatch):
+        calls = []
+        expected_processor = object()
+
+        def fake_from_pretrained(model_id, trust_remote_code=True, use_fast=True):
+            calls.append({
+                "model_id": model_id,
+                "trust_remote_code": trust_remote_code,
+                "use_fast": use_fast,
+            })
+            if use_fast:
+                raise AttributeError(
+                    "TokenizersBackend has no attribute additional_special_tokens"
+                )
+            return expected_processor
+
+        monkeypatch.setattr(
+            florence2_module.AutoProcessor,
+            "from_pretrained",
+            fake_from_pretrained,
+        )
+
+        processor = load_florence_processor("microsoft/Florence-2-base-ft")
+
+        assert processor is expected_processor
+        assert calls == [
+            {
+                "model_id": "microsoft/Florence-2-base-ft",
+                "trust_remote_code": True,
+                "use_fast": True,
+            },
+            {
+                "model_id": "microsoft/Florence-2-base-ft",
+                "trust_remote_code": True,
+                "use_fast": False,
+            },
+        ]
 
     def test_bbox_to_florence_basic(self):
         """A bbox at (0, 0, 100, 100) in a 1000×1000 image → <loc_0><loc_0><loc_100><loc_100>."""

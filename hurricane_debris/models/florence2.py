@@ -31,6 +31,24 @@ from hurricane_debris.utils.logging import get_logger
 logger = get_logger("models.florence2")
 
 
+def load_florence_processor(model_id: str):
+    """Load a Florence-2 processor with a slow-tokenizer fallback."""
+    try:
+        return AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=True
+        )
+    except AttributeError as exc:
+        if "additional_special_tokens" not in str(exc):
+            raise
+
+        logger.warning(
+            "Florence-2 processor load hit tokenizer incompatibility; retrying with use_fast=False"
+        )
+        return AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=True, use_fast=False
+        )
+
+
 def _bbox_coco_to_florence(bbox, img_w: int, img_h: int) -> str:
     """
     Convert a COCO bbox [x, y, w, h] to Florence-2 location tokens.
@@ -76,9 +94,7 @@ class Florence2Trainer:
     def _load_base_model(self):
         logger.info("Loading Florence-2 base model: %s", self.cfg.model_id)
 
-        self.processor = AutoProcessor.from_pretrained(
-            self.cfg.model_id, trust_remote_code=True
-        )
+        self.processor = load_florence_processor(self.cfg.model_id)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_id, torch_dtype=torch.float32, trust_remote_code=True
         ).to(self.device)

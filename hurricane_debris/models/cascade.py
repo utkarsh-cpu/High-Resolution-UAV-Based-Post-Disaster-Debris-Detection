@@ -28,6 +28,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional for lightweight envir
 from PIL import Image
 
 from hurricane_debris.config import DEBRIS_CATEGORIES, ExperimentConfig
+from hurricane_debris.models.florence2 import load_florence_processor
 from hurricane_debris.utils.logging import get_logger
 
 logger = get_logger("models.cascade")
@@ -148,12 +149,10 @@ class CascadedInference:
     # ── Model loading ────────────────────────────────────────────────────
 
     def _load_florence(self, model_dir: str):
-        from transformers import AutoModelForCausalLM, AutoProcessor
+        from transformers import AutoModelForCausalLM
 
         logger.info("Loading fine-tuned Florence-2 from %s", model_dir)
-        self.florence_processor = AutoProcessor.from_pretrained(
-            model_dir, trust_remote_code=True
-        )
+        self.florence_processor = load_florence_processor(model_dir)
         self.florence_model = AutoModelForCausalLM.from_pretrained(
             model_dir, torch_dtype=torch.float32, trust_remote_code=True
         ).to(self.device).eval()
