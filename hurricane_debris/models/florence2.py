@@ -169,7 +169,7 @@ class Florence2Trainer:
             images=images,
             return_tensors="pt",
             padding=True,
-        ).to(self.device)
+        )
 
         # ── Tokenize targets (detection output text) ─────────────────────
         # Labels are the tokenized *output* sequence.
@@ -181,7 +181,7 @@ class Florence2Trainer:
             max_length=self.cfg.max_new_tokens,
         )
 
-        labels = label_encoding["input_ids"].to(self.device)
+        labels = label_encoding["input_ids"]
         # Mask padding tokens with -100 so they're ignored in the loss
         labels[labels == self.processor.tokenizer.pad_token_id] = -100
         inputs["labels"] = labels
