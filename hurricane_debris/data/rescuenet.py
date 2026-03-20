@@ -418,6 +418,20 @@ class RescueNetDataset(Dataset):
 
         return bboxes, cat_ids, inst_masks
 
+    def has_foreground(self, idx: int) -> bool:
+        """Lightweight check: does sample *idx* have any non-background mask pixels?
+
+        Loads only the mask (no image, no transforms, no connected-component
+        analysis) so it runs ~10x faster than a full ``__getitem__`` call.
+        """
+        _, mask_path = self.samples[idx]
+        mask_raw = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+        if mask_raw is None:
+            return False
+        semantic_mask, use_official = self._decode_semantic_mask(mask_raw, mask_path)
+        semantic_mask = self._remap_classes(semantic_mask, official_release=use_official)
+        return bool(np.any(semantic_mask > 0))
+
     def _blank_sample(self, idx: int) -> Dict:
         return {
             "pixel_values": torch.zeros(3, self.image_size, self.image_size),

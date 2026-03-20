@@ -362,24 +362,18 @@ class _FilteredSubset(torch.utils.data.Dataset):
 
 
 def _filter_empty_samples(dataset):
-    """Remove samples with zero detections (no bboxes) to avoid wasted forward passes."""
-    if not hasattr(dataset, 'samples'):
+    """Remove samples with zero foreground pixels to avoid wasted forward passes."""
+    if not hasattr(dataset, 'has_foreground'):
         return dataset
 
-    non_empty_indices = []
-    for i, (_, mask_path) in enumerate(dataset.samples):
-        # Quick check: if mask file exists, assume it may have detections
-        # We'll do a lightweight check using the sample list
-        non_empty_indices.append(i)
-
-    # Actually scan for empty masks — use connected component info already cached
-    # For now, just remove blank samples (those where image couldn't be read)
-    valid_indices = []
     total = len(dataset)
+    logger.info("Scanning %d training samples for empty masks...", total)
+    valid_indices = []
     for i in range(total):
-        sample = dataset[i]
-        if sample["target"]["bboxes"].shape[0] > 0:
+        if dataset.has_foreground(i):
             valid_indices.append(i)
+        if (i + 1) % 500 == 0:
+            logger.info("  scanned %d / %d samples ...", i + 1, total)
 
     removed = total - len(valid_indices)
     if removed > 0:
@@ -388,6 +382,7 @@ def _filter_empty_samples(dataset):
             removed, total, len(valid_indices),
         )
         return _FilteredSubset(dataset, valid_indices)
+    logger.info("All %d samples have foreground content", total)
     return dataset
 
 
