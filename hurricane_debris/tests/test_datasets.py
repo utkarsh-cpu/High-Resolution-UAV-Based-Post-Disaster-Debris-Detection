@@ -18,6 +18,7 @@ from hurricane_debris.data.base_dataset import DebrisDataset
 from hurricane_debris.data.designsafe import DesignSafeDataset
 from hurricane_debris.data.msnet import MSNetDataset
 from hurricane_debris.data.rescuenet import RescueNetDataset
+from hurricane_debris.data.transforms import get_train_transforms
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -92,6 +93,19 @@ def dummy_dataset_dir():
 
 
 class TestDebrisDataset:
+
+    def test_train_transforms_apply_with_current_albumentations_api(self):
+        transform = get_train_transforms(image_size=128)
+        image = np.zeros((256, 256, 3), dtype=np.uint8)
+
+        transformed = transform(
+            image=image,
+            bboxes=[[32, 32, 64, 64]],
+            category_ids=[3],
+        )
+
+        assert transformed["image"].shape == (3, 128, 128)
+        assert len(transformed["bboxes"]) == 1
 
     def test_length(self, dummy_dataset_dir):
         ds = DebrisDataset(dummy_dataset_dir, split="val")
