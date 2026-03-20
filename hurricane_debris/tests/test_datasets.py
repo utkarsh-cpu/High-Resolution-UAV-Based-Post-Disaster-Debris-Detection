@@ -18,7 +18,7 @@ from hurricane_debris.data.base_dataset import DebrisDataset
 from hurricane_debris.data.designsafe import DesignSafeDataset
 from hurricane_debris.data.msnet import MSNetDataset
 from hurricane_debris.data.rescuenet import RescueNetDataset
-from hurricane_debris.data.transforms import get_train_transforms
+from hurricane_debris.data.transforms import get_train_transforms, stack_instance_masks
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -106,6 +106,25 @@ class TestDebrisDataset:
 
         assert transformed["image"].shape == (3, 128, 128)
         assert len(transformed["bboxes"]) == 1
+
+    def test_stack_instance_masks_accepts_tensor_masks_from_albumentations(self):
+        transform = get_train_transforms(image_size=128)
+        image = np.zeros((256, 256, 3), dtype=np.uint8)
+        mask = np.zeros((256, 256), dtype=np.uint8)
+        mask[32:160, 32:160] = 1
+
+        transformed = transform(
+            image=image,
+            bboxes=[[32, 32, 128, 128]],
+            category_ids=[3],
+            masks=[mask],
+        )
+
+        stacked_masks = stack_instance_masks(transformed["masks"], image_size=128)
+
+        assert isinstance(transformed["masks"][0], torch.Tensor)
+        assert stacked_masks.shape == (1, 128, 128)
+        assert stacked_masks.dtype == torch.float32
 
     def test_length(self, dummy_dataset_dir):
         ds = DebrisDataset(dummy_dataset_dir, split="val")

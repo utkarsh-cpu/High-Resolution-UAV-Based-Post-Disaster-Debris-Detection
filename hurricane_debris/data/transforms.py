@@ -3,10 +3,12 @@ Albumentations transform pipelines for training and evaluation.
 """
 
 import inspect
+from typing import Sequence, Tuple
 
 import albumentations as A
+import numpy as np
+import torch
 from albumentations.pytorch import ToTensorV2
-from typing import Tuple
 
 
 def _random_resized_crop(image_size: int, crop_scale: Tuple[float, float]) -> A.BasicTransform:
@@ -23,6 +25,24 @@ def _gauss_noise(gauss_noise_p: float) -> A.BasicTransform:
     if "std_range" in signature.parameters:
         return A.GaussNoise(std_range=(10.0 / 255.0, 50.0 / 255.0), p=gauss_noise_p)
     return A.GaussNoise(var_limit=(10, 50), p=gauss_noise_p)
+
+
+def stack_instance_masks(
+    masks: Sequence[np.ndarray | torch.Tensor],
+    image_size: int,
+) -> torch.Tensor:
+    """Return a float tensor stack from Albumentations masks across API versions."""
+    if not masks:
+        return torch.zeros((0, image_size, image_size), dtype=torch.float32)
+
+    normalized_masks = []
+    for mask in masks:
+        if isinstance(mask, torch.Tensor):
+            normalized_masks.append(mask.float())
+        else:
+            normalized_masks.append(torch.from_numpy(mask).float())
+
+    return torch.stack(normalized_masks)
 
 
 def get_train_transforms(

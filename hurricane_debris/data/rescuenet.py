@@ -43,7 +43,11 @@ from hurricane_debris.config import (
     RESCUENET_OFFICIAL_CLASS_MAP,
     DataConfig,
 )
-from hurricane_debris.data.transforms import get_train_transforms, get_val_transforms
+from hurricane_debris.data.transforms import (
+    get_train_transforms,
+    get_val_transforms,
+    stack_instance_masks,
+)
 from hurricane_debris.utils.logging import get_logger
 
 logger = get_logger("data.rescuenet")
@@ -273,11 +277,7 @@ class RescueNetDataset(Dataset):
                 torch.tensor(category_ids, dtype=torch.long)
                 if category_ids else torch.zeros(0, dtype=torch.long)
             ),
-            "masks": (
-                torch.stack([torch.from_numpy(m).float() for m in instance_masks])
-                if instance_masks
-                else torch.zeros((0, self.image_size, self.image_size), dtype=torch.float32)
-            ),
+            "masks": stack_instance_masks(instance_masks, self.image_size),
             "semantic_mask": torch.from_numpy(sem_mask_resized).long(),
         }
 
