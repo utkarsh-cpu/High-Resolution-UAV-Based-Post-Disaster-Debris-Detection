@@ -174,16 +174,26 @@ class RescueNetDataset(Dataset):
         for img_path in sorted(self.img_dir.iterdir()):
             if img_path.suffix.lower() not in img_extensions:
                 continue
-            # Mask file typically has the same stem
-            mask_path = self.mask_dir / img_path.name
-            if not mask_path.exists():
-                # Try .png if image is .jpg
-                mask_path = self.mask_dir / (img_path.stem + ".png")
+            mask_path = self._resolve_mask_path(img_path)
             if mask_path.exists():
                 samples.append((img_path, mask_path))
             else:
                 logger.warning("No mask found for %s", img_path.name)
         return samples
+
+    def _resolve_mask_path(self, img_path: Path) -> Path:
+        """Resolve the matching RescueNet mask path for an image file."""
+        candidates = [
+            self.mask_dir / img_path.name,
+            self.mask_dir / f"{img_path.stem}.png",
+            self.mask_dir / f"{img_path.stem}_lab.png",
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        return candidates[-1]
 
     # ── Dataset interface ────────────────────────────────────────────────
 

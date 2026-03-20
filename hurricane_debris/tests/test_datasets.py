@@ -165,6 +165,27 @@ class TestDebrisDataset:
 
 class TestDatasetSpecificSmoke:
 
+    def test_rescuenet_loader_supports_official_lab_suffix_masks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            img_dir = root / "train" / "train-org-img"
+            mask_dir = root / "train" / "train-label-img"
+            img_dir.mkdir(parents=True)
+            mask_dir.mkdir(parents=True)
+
+            img = np.zeros((64, 64, 3), dtype=np.uint8)
+            mask = np.zeros((64, 64), dtype=np.uint8)
+            mask[16:48, 16:48] = 3
+
+            cv2.imwrite(str(img_dir / "10778.jpg"), img)
+            cv2.imwrite(str(mask_dir / "10778_lab.png"), mask)
+
+            ds = RescueNetDataset(root_dir=str(root), split="train", config=DataConfig(image_size=64))
+            assert len(ds) == 1
+            sample = ds[0]
+            assert sample["image_path"].endswith("10778.jpg")
+            assert sample["target"]["bboxes"].shape[0] == 1
+
     def test_rescuenet_loader_smoke(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
