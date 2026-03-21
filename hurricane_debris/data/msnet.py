@@ -8,7 +8,7 @@ and instance segmentation.
 
 Expected directory layout (after download):
     datasets/msnet/
-    ├── images/                     # RGB images
+    ├── images/                     # RGB images (or split dirs train/ val/ test)
     ├── annotations/
     │   ├── instances_train.json    # COCO-format annotations
     │   ├── instances_val.json
@@ -72,15 +72,21 @@ class MSNetDataset(Dataset):
         self.image_size = self.config.image_size
 
         # ── Resolve annotation file ─────────────────────────────────────
+        effective_split = split
         if annotation_file is None:
-            annotation_file = f"annotations/instances_{split}.json"
-        ann_path = self.root_dir / annotation_file
+            ann_path, effective_split = self._resolve_annotation_path(split)
+        else:
+            ann_path = self.root_dir / annotation_file
 
         if not ann_path.exists():
             raise FileNotFoundError(
                 f"Annotation file not found: {ann_path}. "
-                "Please download the MSNet dataset."
+                "Expected annotations/instances_<split>.json under the MSNet root."
             )
+
+        self.annotation_path = ann_path
+        self.effective_split = effective_split
+        self.image_dir = self._resolve_image_dir(effective_split)
 
         with open(ann_path) as f:
             self.coco = json.load(f)
@@ -102,10 +108,12 @@ class MSNetDataset(Dataset):
         ]
 
         logger.info(
-            "MSNet [%s]: %d annotated images, %d annotations",
+            "MSNet [%s -> %s]: %d annotated images, %d annotations (images: %s)",
             split,
+            effective_split,
             len(self.images),
             sum(len(v) for v in self.img_to_ann.values()),
+            self.image_dir,
         )
 
         # ── Transforms ──────────────────────────────────────────────────
@@ -130,7 +138,7 @@ class MSNetDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict:
         img_info = self.images[idx]
-        img_path = self.root_dir / "images" / img_info["file_name"]
+        img_path = self.image_dir / img_info["file_name"]
 
         image = cv2.imread(str(img_path))
         if image is None:
@@ -228,6 +236,37 @@ class MSNetDataset(Dataset):
         }
 
     # ── Helpers ──────────────────────────────────────────────────────────
+
+    def _resolve_annotation_path(self, requested_split: str) -> Tuple[Path, str]:
+        preferred = self.root_dir / "annotations" / f"instances_{requested_split}.json"
+        if preferred.exists():
+            return preferred, requested_split
+
+        if requested_split == "test":
+            fallback = self.root_dir / "annotations" / "instances_val.json"
+            if fallback.exists():
+                logger.warning(
+                    "MSNet split 'test' is unavailable at %s; falling back to validation annotations %s.",
+                    preferred,
+                    fallback,
+                )
+                return fallback, "val"
+
+        return preferred, requested_split
+
+    def _resolve_image_dir(self, effective_split: str) -> Path:
+        candidates = [
+            self.root_dir / effective_split,
+            self.root_dir / "images",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        raise FileNotFoundError(
+            "Image directory not found for MSNet. Expected one of: "
+            + ", ".join(str(path) for path in candidates)
+        )
 
     def _map_category(self, ann: Dict) -> int:
         """Map an MSNet annotation to the unified category ID."""

@@ -309,3 +309,47 @@ class TestDatasetSpecificSmoke:
             sample = ds[0]
             assert "image_path" in sample
             assert sample["target"]["bboxes"].shape[1] == 4
+
+    def test_msnet_loader_supports_split_image_dirs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "val").mkdir(parents=True)
+            (root / "annotations").mkdir(parents=True)
+
+            img = np.zeros((64, 64, 3), dtype=np.uint8)
+            cv2.imwrite(str(root / "val" / "sample.png"), img)
+
+            coco = {
+                "images": [{"id": 1, "file_name": "sample.png", "height": 64, "width": 64}],
+                "annotations": [{"id": 1, "image_id": 1, "category_id": 2, "bbox": [10, 10, 20, 20]}],
+                "categories": [{"id": 2, "name": "major-damage"}],
+            }
+            with open(root / "annotations" / "instances_val.json", "w") as f:
+                json.dump(coco, f)
+
+            ds = MSNetDataset(root_dir=str(root), split="val", config=DataConfig(image_size=64))
+            sample = ds[0]
+            assert Path(sample["image_path"]).parent == root / "val"
+
+    def test_msnet_loader_falls_back_from_test_to_val(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "val").mkdir(parents=True)
+            (root / "annotations").mkdir(parents=True)
+
+            img = np.zeros((64, 64, 3), dtype=np.uint8)
+            cv2.imwrite(str(root / "val" / "sample.png"), img)
+
+            coco = {
+                "images": [{"id": 1, "file_name": "sample.png", "height": 64, "width": 64}],
+                "annotations": [{"id": 1, "image_id": 1, "category_id": 2, "bbox": [10, 10, 20, 20]}],
+                "categories": [{"id": 2, "name": "major-damage"}],
+            }
+            with open(root / "annotations" / "instances_val.json", "w") as f:
+                json.dump(coco, f)
+
+            ds = MSNetDataset(root_dir=str(root), split="test", config=DataConfig(image_size=64))
+            assert ds.effective_split == "val"
+            assert ds.annotation_path == root / "annotations" / "instances_val.json"
+            sample = ds[0]
+            assert Path(sample["image_path"]).parent == root / "val"
