@@ -1,13 +1,13 @@
 {
   "args": {
-    "full_pipeline": true,
+    "full_pipeline": false,
     "train_florence": false,
     "train_sam2": false,
-    "evaluate": false,
+    "evaluate": true,
     "infer": false,
     "download": false,
-    "dataset_dir": "./datasets/rescuenet",
-    "dataset": "rescuenet",
+    "dataset_dir": "./datasets",
+    "dataset": "msnet",
     "florence_dir": "./models/florence2_debris",
     "sam2_dir": "./models/sam2_debris",
     "sam2_checkpoint": "./checkpoints/sam2_hiera_large.pt",
@@ -31,7 +31,7 @@
   },
   "config": {
     "data": {
-      "dataset_root": "./datasets/rescuenet",
+      "dataset_root": "./datasets",
       "image_size": 768,
       "image_mean": [
         0.485,
@@ -62,7 +62,7 @@
     "florence2": {
       "model_id": "microsoft/Florence-2-base-ft",
       "lora_r": 16,
-      "lora_alpha": 32,
+      "lora_alpha": 16,
       "lora_dropout": 0.1,
       "lora_target_modules": [
         "q_proj",
@@ -74,8 +74,8 @@
       "learning_rate": 5e-05,
       "weight_decay": 0.01,
       "warmup_ratio": 0.1,
-      "gradient_accumulation_steps": 4,
-      "max_new_tokens": 1024,
+      "gradient_accumulation_steps": 2,
+      "max_new_tokens": 512,
       "num_beams": 3,
       "early_stopping_patience": 3,
       "output_dir": "./models/florence2_debris"
@@ -89,7 +89,8 @@
       "num_epochs": 20,
       "learning_rate": 1e-05,
       "weight_decay": 0.01,
-      "batch_size": 2,
+      "batch_size": 4,
+      "gradient_accumulation_steps": 2,
       "multimask_output": true,
       "bce_weight": 1.0,
       "dice_weight": 1.0,

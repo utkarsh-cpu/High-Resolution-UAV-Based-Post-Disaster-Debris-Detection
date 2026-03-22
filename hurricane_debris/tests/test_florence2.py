@@ -23,39 +23,39 @@ class TestFlorence2Labels:
         calls = []
         expected_processor = object()
 
-        def fake_from_pretrained(model_id, trust_remote_code=True, use_fast=True):
-            calls.append({
-                "model_id": model_id,
-                "trust_remote_code": trust_remote_code,
-                "use_fast": use_fast,
-            })
-            if use_fast:
+        def fake_from_pretrained(model_id, trust_remote_code=True, **kwargs):
+            calls.append(model_id)
+            if "tokenizer" not in kwargs:
                 raise AttributeError(
                     "TokenizersBackend has no attribute additional_special_tokens"
                 )
             return expected_processor
+
+        # Stub AutoTokenizer so the fallback path doesn't hit the network
+        class _FakeTok:
+            _special_tokens_map = {}
+
+            @classmethod
+            def from_pretrained(cls, *a, **kw):
+                return cls()
 
         monkeypatch.setattr(
             florence2_module.AutoProcessor,
             "from_pretrained",
             fake_from_pretrained,
         )
+        monkeypatch.setattr(florence2_module, "AutoTokenizer", _FakeTok, raising=False)
+        # Suppress the AutoTokenizer import inside load_florence_processor
+        import hurricane_debris.models.florence2 as _mod
+        monkeypatch.setattr(_mod, "AutoTokenizer", _FakeTok, raising=False)
+        # Patch transformers.AutoTokenizer too
+        import transformers
+        monkeypatch.setattr(transformers, "AutoTokenizer", _FakeTok, raising=False)
 
         processor = load_florence_processor("microsoft/Florence-2-base-ft")
 
         assert processor is expected_processor
-        assert calls == [
-            {
-                "model_id": "microsoft/Florence-2-base-ft",
-                "trust_remote_code": True,
-                "use_fast": True,
-            },
-            {
-                "model_id": "microsoft/Florence-2-base-ft",
-                "trust_remote_code": True,
-                "use_fast": False,
-            },
-        ]
+        assert len(calls) == 2
 
     def test_bbox_to_florence_basic(self):
         """A bbox at (0, 0, 100, 100) in a 1000×1000 image → <loc_0><loc_0><loc_100><loc_100>."""

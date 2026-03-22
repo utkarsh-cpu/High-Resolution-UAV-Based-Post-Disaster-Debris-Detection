@@ -16,7 +16,10 @@ from torch.utils.data import Dataset
 from hurricane_debris.config import CATEGORY_QUERIES, DataConfig
 from hurricane_debris.data.transforms import (
     get_train_transforms,
+    get_train_spatial_transforms,
     get_val_transforms,
+    get_val_spatial_transforms,
+    normalize_and_tensorize,
     stack_instance_masks,
 )
 from hurricane_debris.utils.logging import get_logger
@@ -72,22 +75,20 @@ class DebrisDataset(Dataset):
                 "Filtered to %d images for split='%s'", len(self.images), split
             )
 
-        # ── Augmentation pipeline ───────────────────────────────────────
+        # ── Augmentation pipeline (split for raw_image support) ────────
         if split == "train" and self.config.augment_train:
-            self.transform = get_train_transforms(
+            self.spatial_transform = get_train_spatial_transforms(
                 image_size=self.image_size,
                 crop_scale=self.config.random_crop_scale,
-                mean=self.config.image_mean,
-                std=self.config.image_std,
                 color_jitter_p=self.config.color_jitter_p,
                 gauss_noise_p=self.config.gauss_noise_p,
             )
         else:
-            self.transform = get_val_transforms(
+            self.spatial_transform = get_val_spatial_transforms(
                 image_size=self.image_size,
-                mean=self.config.image_mean,
-                std=self.config.image_std,
             )
+        self._norm_mean = self.config.image_mean
+        self._norm_std = self.config.image_std
 
     # ── Index helpers ────────────────────────────────────────────────────
 
@@ -137,24 +138,28 @@ class DebrisDataset(Dataset):
         try:
             if len(bboxes) > 0:
                 extra = {"masks": masks} if masks else {}
-                transformed = self.transform(
+                transformed = self.spatial_transform(
                     image=image,
                     bboxes=bboxes,
                     category_ids=category_ids,
                     **extra,
                 )
-                image_t = transformed["image"]
+                aug_image = transformed["image"]
                 bboxes = list(transformed["bboxes"])
                 category_ids = list(transformed["category_ids"])
                 masks = transformed.get("masks", [])
             else:
-                transformed = self.transform(
+                transformed = self.spatial_transform(
                     image=image, bboxes=[], category_ids=[]
                 )
-                image_t = transformed["image"]
+                aug_image = transformed["image"]
         except Exception as e:
             logger.warning("Transform failed for image %s: %s", img_path.name, e)
             return self._blank_sample(img_info["id"])
+
+        from PIL import Image as _PILImage
+        raw_image = _PILImage.fromarray(aug_image)
+        image_t = normalize_and_tensorize(aug_image, self._norm_mean, self._norm_std)
 
         # ── Build target dict ───────────────────────────────────────────
         text_queries = [
@@ -178,6 +183,7 @@ class DebrisDataset(Dataset):
 
         return {
             "pixel_values": image_t,
+            "raw_image": raw_image,
             "target": target,
             "image_id": img_info["id"],
             "image_path": str(img_path),

@@ -29,7 +29,10 @@ from torch.utils.data import Dataset
 from hurricane_debris.config import CATEGORY_QUERIES, MSNET_DAMAGE_MAP, DataConfig
 from hurricane_debris.data.transforms import (
     get_train_transforms,
+    get_train_spatial_transforms,
     get_val_transforms,
+    get_val_spatial_transforms,
+    normalize_and_tensorize,
     stack_instance_masks,
 )
 from hurricane_debris.utils.logging import get_logger
@@ -37,13 +40,20 @@ from hurricane_debris.utils.logging import get_logger
 logger = get_logger("data.msnet")
 
 # MSNet native class names → our unified category IDs
+# MSNet/ISBDA class mapping — per the ISBDA paper (Zhu et al. WACV 2021):
+#   category 1 = Slight damage (visible cracks / appearance damage)
+#   category 2 = Severe damage (partial wall / roof collapse)
+#   category 3 = Debris (completely collapsed buildings)
 _MSNET_CLASS_MAP = {
     "no-damage": 0,
-    "minor-damage": 2,      # building_no_damage (low severity)
+    "minor-damage": 3,      # building_damaged
     "major-damage": 3,      # building_damaged
     "destroyed": 3,          # building_damaged
     "un-classified": 0,
-    # Some MSNet variants use numeric IDs
+    # Numeric category names from ISBDA COCO annotations
+    "1": 3,                  # Slight damage → building_damaged
+    "2": 3,                  # Severe damage → building_damaged
+    "3": 3,                  # Debris (collapsed) → building_damaged
 }
 
 
@@ -116,20 +126,18 @@ class MSNetDataset(Dataset):
             self.image_dir,
         )
 
-        # ── Transforms ──────────────────────────────────────────────────
+        # ── Transforms (split spatial + normalize for raw_image support) ─
         if split == "train" and self.config.augment_train:
-            self.transform = get_train_transforms(
+            self.spatial_transform = get_train_spatial_transforms(
                 image_size=self.image_size,
                 crop_scale=self.config.random_crop_scale,
-                mean=self.config.image_mean,
-                std=self.config.image_std,
             )
         else:
-            self.transform = get_val_transforms(
+            self.spatial_transform = get_val_spatial_transforms(
                 image_size=self.image_size,
-                mean=self.config.image_mean,
-                std=self.config.image_std,
             )
+        self._norm_mean = self.config.image_mean
+        self._norm_std = self.config.image_std
 
     # ── Dataset interface ────────────────────────────────────────────────
 
@@ -158,6 +166,22 @@ class MSNetDataset(Dataset):
                 continue  # skip background / no-damage
 
             bbox = ann.get("bbox")
+            if bbox is None:
+                # Derive bbox from segmentation polygons when available
+                seg = ann.get("segmentation", [])
+                if seg and isinstance(seg, list) and len(seg) > 0:
+                    try:
+                        all_pts = np.concatenate(
+                            [np.array(p, dtype=np.float32).reshape(-1, 2) for p in seg]
+                        )
+                        x1, y1 = all_pts.min(axis=0)
+                        x2, y2 = all_pts.max(axis=0)
+                        bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+                    except (ValueError, IndexError):
+                        bbox = None
+            if bbox is None:
+                # Fall back to damage_bbox (specific damaged area), then house_bbox
+                bbox = ann.get("damage_bbox", ann.get("house_bbox"))
             if bbox is None:
                 # Try oriented bbox → axis-aligned conversion
                 obbox = ann.get("oriented_bbox", ann.get("obbox"))
@@ -193,17 +217,17 @@ class MSNetDataset(Dataset):
             if bboxes:
                 if masks and len(masks) == len(bboxes):
                     extra["masks"] = masks
-                transformed = self.transform(
+                transformed = self.spatial_transform(
                     image=image,
                     bboxes=bboxes,
                     category_ids=category_ids,
                     **extra,
                 )
             else:
-                transformed = self.transform(
+                transformed = self.spatial_transform(
                     image=image, bboxes=[], category_ids=[]
                 )
-            image_t = transformed["image"]
+            aug_image = transformed["image"]  # uint8 HWC numpy
             bboxes = list(transformed.get("bboxes", []))
             category_ids = list(transformed.get("category_ids", []))
             masks = transformed.get("masks", [])
@@ -211,9 +235,22 @@ class MSNetDataset(Dataset):
             logger.warning("Transform failed for %s: %s", img_path.name, e)
             return self._blank(idx)
 
+        from PIL import Image as _PILImage
+        raw_image = _PILImage.fromarray(aug_image)
+        image_t = normalize_and_tensorize(aug_image, self._norm_mean, self._norm_std)
+
         text_queries = [
             CATEGORY_QUERIES.get(cid, "debris") for cid in category_ids
         ]
+
+        # Build semantic mask from instance masks + category IDs
+        instance_masks = stack_instance_masks(masks, self.image_size)
+        semantic_mask = torch.zeros(
+            (self.image_size, self.image_size), dtype=torch.long
+        )
+        for i, cid in enumerate(category_ids):
+            if i < instance_masks.shape[0]:
+                semantic_mask[instance_masks[i] > 0.5] = cid
 
         target = {
             "bboxes": (
@@ -225,11 +262,13 @@ class MSNetDataset(Dataset):
                 torch.tensor(category_ids, dtype=torch.long)
                 if category_ids else torch.zeros(0, dtype=torch.long)
             ),
-            "masks": stack_instance_masks(masks, self.image_size),
+            "masks": instance_masks,
+            "semantic_mask": semantic_mask,
         }
 
         return {
             "pixel_values": image_t,
+            "raw_image": raw_image,
             "target": target,
             "image_id": img_info["id"],
             "image_path": str(img_path),
@@ -320,6 +359,9 @@ class MSNetDataset(Dataset):
                 "labels": [],
                 "category_ids": torch.zeros(0, dtype=torch.long),
                 "masks": torch.zeros((0, self.image_size, self.image_size)),
+                "semantic_mask": torch.zeros(
+                    (self.image_size, self.image_size), dtype=torch.long
+                ),
             },
             "image_id": idx,
             "image_path": "",

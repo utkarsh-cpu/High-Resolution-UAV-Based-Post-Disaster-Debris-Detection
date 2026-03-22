@@ -8,12 +8,42 @@ Key fixes vs. first_draft.py:
   4. Integrated with centralized config and logging.
 """
 
+import importlib
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+
+
+def _preload_hf_datasets_module():
+    """Ensure transformers resolves the Hugging Face datasets package.
+
+    The repository has a top-level datasets/ directory that would otherwise
+    shadow the external package when Trainer imports its optional integrations.
+    """
+    existing = sys.modules.get("datasets")
+    if existing is not None and hasattr(existing, "Dataset"):
+        return
+
+    repo_root = Path(__file__).resolve().parents[2]
+    original_sys_path = list(sys.path)
+    try:
+        sys.modules.pop("datasets", None)
+        sys.path = [
+            path for path in sys.path
+            if Path(path or ".").resolve() != repo_root
+        ]
+        hf_datasets = importlib.import_module("datasets")
+        sys.modules["datasets"] = hf_datasets
+    finally:
+        sys.path = original_sys_path
+
+
+_preload_hf_datasets_module()
+
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -29,22 +59,121 @@ from hurricane_debris.utils.logging import get_logger
 logger = get_logger("models.florence2")
 
 
+def _fix_florence2_weight_tying(model):
+    """Restore tied embeddings broken by Transformers 5.x.
+
+    Florence-2 shares one embedding tensor across encoder, decoder, and
+    lm_head.  The checkpoint stores it under ``language_model.model.shared``
+    and expects the library to tie the other three.  Transformers 5.x
+    sometimes fails to do this, leaving encoder/decoder/lm_head randomly
+    initialized.  This function copies the correct ``shared`` weight to
+    all three locations.
+    """
+    lm = getattr(model, "language_model", None)
+    if lm is None:
+        return
+    inner = getattr(lm, "model", None)
+    if inner is None:
+        return
+    shared = getattr(inner, "shared", None)
+    if shared is None:
+        return
+
+    import torch as _torch
+
+    shared_w = shared.weight.data
+    enc_emb = inner.encoder.embed_tokens.weight.data
+    dec_emb = inner.decoder.embed_tokens.weight.data
+    lm_head = lm.lm_head.weight.data
+
+    needs_fix = not (
+        _torch.equal(shared_w, enc_emb)
+        and _torch.equal(shared_w, dec_emb)
+        and _torch.equal(shared_w, lm_head)
+    )
+    if needs_fix:
+        inner.encoder.embed_tokens.weight = shared.weight
+        inner.decoder.embed_tokens.weight = shared.weight
+        lm.lm_head.weight = shared.weight
+        logger.info(
+            "Fixed Florence-2 weight tying: copied shared embedding "
+            "(norm=%.1f) to encoder/decoder/lm_head",
+            shared_w.norm().item(),
+        )
+
+
+def _ensure_slow_image_processor(processor, model_id: str):
+    """Replace fast CLIPImageProcessor with slow version if resize is broken."""
+    from transformers import CLIPImageProcessor
+
+    if hasattr(processor, "image_processor"):
+        ip = processor.image_processor
+        if type(ip).__name__ == "CLIPImageProcessorFast":
+            processor.image_processor = CLIPImageProcessor.from_pretrained(
+                model_id
+            )
+    return processor
+
+
 def load_florence_processor(model_id: str):
-    """Load a Florence-2 processor with a slow-tokenizer fallback."""
+    """Load a Florence-2 processor with a slow-tokenizer fallback.
+
+    Transformers 5.x may fail to restore ``additional_special_tokens``
+    automatically for RobertaTokenizer-based checkpoints.  When that
+    happens we load the tokenizer separately, patch the missing tokens
+    from the saved ``special_tokens_map.json``, and pass it to the
+    processor constructor.
+
+    Also forces the slow CLIPImageProcessor to guarantee correct resizing
+    (the fast variant may skip resize in some Transformers versions).
+    """
     try:
-        return AutoProcessor.from_pretrained(
+        proc = AutoProcessor.from_pretrained(
             model_id, trust_remote_code=True
         )
+        return _ensure_slow_image_processor(proc, model_id)
     except AttributeError as exc:
         if "additional_special_tokens" not in str(exc):
             raise
 
         logger.warning(
-            "Florence-2 processor load hit tokenizer incompatibility; retrying with use_fast=False"
+            "Florence-2 processor load hit tokenizer incompatibility; "
+            "patching additional_special_tokens manually"
         )
-        return AutoProcessor.from_pretrained(
+
+        from transformers import AutoTokenizer
+        import json
+        from pathlib import Path
+
+        tok = AutoTokenizer.from_pretrained(
             model_id, trust_remote_code=True, use_fast=False
         )
+
+        if not hasattr(tok.__class__, "additional_special_tokens"):
+            tok.__class__.additional_special_tokens = property(
+                lambda self: list(
+                    self._special_tokens_map.get("additional_special_tokens", [])
+                )
+            )
+
+        stm_path = Path(model_id) / "special_tokens_map.json"
+        extra_tokens = []
+        if stm_path.exists():
+            with open(stm_path) as f:
+                stm = json.load(f)
+            extra_tokens = [
+                t["content"] if isinstance(t, dict) else t
+                for t in stm.get("additional_special_tokens", [])
+            ]
+
+        # Transformers 5.x stores extra special tokens internally but the
+        # Florence remote processor expects a public attribute as well.
+        tok._special_tokens_map["additional_special_tokens"] = extra_tokens
+
+        proc = AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=True, tokenizer=tok
+        )
+        return _ensure_slow_image_processor(proc, model_id)
 
 
 def _bbox_coco_to_florence(bbox, img_w: int, img_h: int) -> str:
@@ -100,7 +229,9 @@ class Florence2Trainer:
             _dtype = torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_id, torch_dtype=_dtype, trust_remote_code=True
-        ).to(self.device)
+        )
+        _fix_florence2_weight_tying(self.model)
+        self.model = self.model.to(self.device)
 
     def setup_lora(self):
         """Attach LoRA adapters for parameter-efficient fine-tuning."""
@@ -136,19 +267,9 @@ class Florence2Trainer:
             bboxes = target["bboxes"]  # [N, 4] tensor
             labels = target["labels"]  # list of category name strings
 
-            # ── Build the target output text the model should generate ──
-            detection_strs = []
-            for bbox, label in zip(bboxes, labels):
-                loc_tokens = _bbox_coco_to_florence(
-                    bbox.tolist(), self.image_size, self.image_size
-                )
-                detection_strs.append(f"{label}{loc_tokens}")
-
-            target_text = "".join(detection_strs) if detection_strs else ""
-
             # Use raw PIL image directly — no expensive denormalize round-trip
             if "raw_image" in example:
-                images.append(example["raw_image"])
+                pil_img = example["raw_image"]
             else:
                 # Fallback: denormalize tensor → PIL (for datasets without raw_image)
                 import numpy as np
@@ -159,8 +280,25 @@ class Florence2Trainer:
                     + np.array([0.485, 0.456, 0.406])
                 )
                 img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
-                images.append(Image.fromarray(img_np))
-            prompts.append("<OPEN_VOCABULARY_DETECTION>")
+                pil_img = Image.fromarray(img_np)
+
+            # Normalise bboxes using the ACTUAL image dimensions (not a
+            # hardcoded constant) so that loc tokens span the full 0-999
+            # range regardless of the spatial-transform resolution.
+            img_w, img_h = pil_img.size
+
+            # ── Build the target output text the model should generate ──
+            detection_strs = []
+            for bbox, label in zip(bboxes, labels):
+                loc_tokens = _bbox_coco_to_florence(
+                    bbox.tolist(), img_w, img_h
+                )
+                detection_strs.append(f"{label}{loc_tokens}")
+
+            target_text = "".join(detection_strs) if detection_strs else ""
+
+            images.append(pil_img)
+            prompts.append("<OD>")
             target_texts.append(target_text)
 
         # ── Tokenize inputs (prompt) ─────────────────────────────────────
@@ -187,11 +325,6 @@ class Florence2Trainer:
         inputs["labels"] = labels
 
         return inputs
-
-    @property
-    def image_size(self) -> int:
-        """Shortcut to the image size used by the dataset."""
-        return 512  # Reduced from 768; ~55% fewer vision encoder FLOPs
 
     # ── Training ─────────────────────────────────────────────────────────
 
@@ -263,9 +396,14 @@ class Florence2Trainer:
     # ── Inference ────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def inference(self, image: Image.Image, query: str) -> Dict:
-        """Run open-vocabulary detection on a single image."""
-        prompt = f"<OPEN_VOCABULARY_DETECTION>{query}"
+    def inference(self, image: Image.Image, query: str = "") -> Dict:
+        """Run object detection on a single image.
+
+        Uses the ``<OD>`` task token (standard object detection) to match
+        the training prompt.  The *query* parameter is accepted for API
+        compatibility but ignored by the fine-tuned model.
+        """
+        prompt = "<OD>"
 
         inputs = self.processor(
             text=prompt, images=image, return_tensors="pt"
@@ -284,7 +422,7 @@ class Florence2Trainer:
 
         parsed = self.processor.post_process_generation(
             generated_text,
-            task="<OPEN_VOCABULARY_DETECTION>",
+            task="<OD>",
             image_size=(image.width, image.height),
         )
         return parsed

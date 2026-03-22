@@ -60,12 +60,13 @@ RESCUENET_OFFICIAL_CLASS_MAP = {
     10: 1,  # Pool → water
 }
 
-# MSNet damage level mapping → unified taxonomy (coarser)
+# MSNet/ISBDA damage level mapping → unified taxonomy
+# Per Zhu et al. WACV 2021: 1=Slight, 2=Severe, 3=Debris (all are damage)
 MSNET_DAMAGE_MAP = {
     0: 0,  # No damage → background
-    1: 2,  # Minor damage → building_no_damage (treated as low-severity)
-    2: 3,  # Major damage → building_damaged
-    3: 3,  # Destroyed → building_damaged
+    1: 3,  # Slight damage → building_damaged
+    2: 3,  # Severe damage → building_damaged
+    3: 3,  # Debris (collapsed) → building_damaged
 }
 
 
@@ -117,7 +118,7 @@ class Florence2Config:
 
     # LoRA
     lora_r: int = 16
-    lora_alpha: int = 32
+    lora_alpha: int = 16
     lora_dropout: float = 0.1
     lora_target_modules: List[str] = field(
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]

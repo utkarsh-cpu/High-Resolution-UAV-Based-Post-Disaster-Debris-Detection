@@ -46,7 +46,10 @@ from hurricane_debris.config import (
 )
 from hurricane_debris.data.transforms import (
     get_train_transforms,
+    get_train_spatial_transforms,
     get_val_transforms,
+    get_val_spatial_transforms,
+    normalize_and_tensorize,
     stack_instance_masks,
 )
 from hurricane_debris.utils.logging import get_logger
@@ -155,20 +158,20 @@ class RescueNetDataset(Dataset):
             split, len(self.samples), self.img_dir,
         )
 
-        # Transforms
+        # Transforms — split into spatial + normalize so we can capture
+        # the augmented-but-unnormalized image as ``raw_image`` for
+        # Florence-2 training (avoids lossy denormalize roundtrip).
         if split == "train" and self.config.augment_train:
-            self.transform = get_train_transforms(
+            self.spatial_transform = get_train_spatial_transforms(
                 image_size=self.image_size,
                 crop_scale=self.config.random_crop_scale,
-                mean=self.config.image_mean,
-                std=self.config.image_std,
             )
         else:
-            self.transform = get_val_transforms(
+            self.spatial_transform = get_val_spatial_transforms(
                 image_size=self.image_size,
-                mean=self.config.image_mean,
-                std=self.config.image_std,
             )
+        self._norm_mean = self.config.image_mean
+        self._norm_std = self.config.image_std
 
     # ── Discovery ────────────────────────────────────────────────────────
 
@@ -215,11 +218,6 @@ class RescueNetDataset(Dataset):
             return self._blank_sample(idx)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Keep a raw PIL copy for Florence-2 processor (avoids denormalize round-trip)
-        raw_pil = Image.fromarray(
-            cv2.resize(image, (self.image_size, self.image_size))
-        )
-
         # Load semantic mask (pixel value = class ID or official RGB colour mask)
         semantic_mask_raw = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
         if semantic_mask_raw is None:
@@ -235,6 +233,15 @@ class RescueNetDataset(Dataset):
             official_release=use_official_map,
         )
 
+        # Ensure mask matches image spatial dimensions before extracting instances
+        h_img, w_img = image.shape[:2]
+        h_mask, w_mask = semantic_mask.shape[:2]
+        if (h_mask, w_mask) != (h_img, w_img):
+            semantic_mask = cv2.resize(
+                semantic_mask, (w_img, h_img),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
         # Derive per-instance bboxes + masks from connected components
         bboxes, category_ids, instance_masks = self._mask_to_instances(
             semantic_mask, image.shape[1], image.shape[0]
@@ -243,24 +250,27 @@ class RescueNetDataset(Dataset):
         # ── Apply augmentations ──────────────────────────────────────────
         try:
             if bboxes:
-                transformed = self.transform(
+                transformed = self.spatial_transform(
                     image=image,
                     bboxes=bboxes,
                     category_ids=category_ids,
                     masks=instance_masks,
                 )
-                image_t = transformed["image"]
+                aug_image = transformed["image"]  # uint8 HWC numpy
                 bboxes = list(transformed["bboxes"])
                 category_ids = list(transformed["category_ids"])
                 instance_masks = transformed.get("masks", [])
             else:
-                transformed = self.transform(
+                transformed = self.spatial_transform(
                     image=image, bboxes=[], category_ids=[]
                 )
-                image_t = transformed["image"]
+                aug_image = transformed["image"]
         except Exception as e:
             logger.warning("Transform failed for %s: %s", img_path.name, e)
             return self._blank_sample(idx)
+
+        raw_image = Image.fromarray(aug_image)  # PIL for Florence-2 collate
+        image_t = normalize_and_tensorize(aug_image, self._norm_mean, self._norm_std)
 
         # Resize semantic mask to target size for evaluation
         sem_mask_resized = cv2.resize(
@@ -289,7 +299,7 @@ class RescueNetDataset(Dataset):
 
         return {
             "pixel_values": image_t,
-            "raw_image": raw_pil,
+            "raw_image": raw_image,
             "target": target,
             "image_id": idx,
             "image_path": str(img_path),
@@ -435,7 +445,6 @@ class RescueNetDataset(Dataset):
     def _blank_sample(self, idx: int) -> Dict:
         return {
             "pixel_values": torch.zeros(3, self.image_size, self.image_size),
-            "raw_image": Image.new("RGB", (self.image_size, self.image_size)),
             "target": {
                 "bboxes": torch.zeros((0, 4), dtype=torch.float32),
                 "labels": [],

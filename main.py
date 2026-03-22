@@ -190,6 +190,7 @@ class CascadePredictor:
 
         sam2_best = str(Path(args.sam2_dir) / "best_model.pth")
         self._category_to_id = _category_name_to_id()
+        self._image_size = config.data.image_size
         self.pipeline = CascadedInference(
             florence_model_dir=args.florence_dir,
             sam2_checkpoint=sam2_best,
@@ -198,12 +199,24 @@ class CascadePredictor:
         )
 
     def predict(self, sample: dict) -> dict:
+        import cv2
+
         image_path = sample.get("image_path")
         if not image_path:
             raise ValueError("Sample is missing image_path; cannot run cascade inference")
 
         result = self.pipeline.run(str(image_path), score_threshold=0.0)
+
+        # Rescale predicted bboxes from original image space to the
+        # dataset's image_size space so they match GT coordinates.
+        sz = self._image_size
+        scale_x = sz / result.width if result.width else 1.0
+        scale_y = sz / result.height if result.height else 1.0
+
         bboxes = np.asarray([d.bbox for d in result.detections], dtype=float).reshape(-1, 4)
+        if bboxes.size:
+            bboxes[:, [0, 2]] *= scale_x
+            bboxes[:, [1, 3]] *= scale_y
         scores = np.asarray([d.score for d in result.detections], dtype=float).reshape(-1)
         labels = np.asarray(
             [self._category_to_id.get(d.category, 3) for d in result.detections],
@@ -218,6 +231,12 @@ class CascadePredictor:
                     continue
                 cid = self._category_to_id.get(det.category, 3)
                 semantic_mask[det.mask.astype(bool)] = cid
+            # Resize to match GT mask resolution (config.data.image_size)
+            sz = self._image_size
+            semantic_mask = cv2.resize(
+                semantic_mask.astype(np.uint8), (sz, sz),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(np.int64)
             out["semantic_mask"] = semantic_mask
 
         return out
@@ -280,15 +299,11 @@ def _save_run_artifacts(config: ExperimentConfig, args):
     logger.info("Run configuration saved to %s", artifact_path)
 
 
-def load_dataset(args, config: ExperimentConfig, split: str):
-    """Load the appropriate dataset based on CLI args."""
-    dataset_root = _resolve_dataset_dir(
-        args.dataset_dir,
-        args.dataset,
-        getattr(args, "cross_dataset", False),
-    )
+def _load_single_dataset(dataset_name: str, dataset_dir: str, config: ExperimentConfig, split: str, cross_dataset: bool = False):
+    """Load a single dataset by name. Returns the dataset or raises on failure."""
+    dataset_root = _resolve_dataset_dir(dataset_dir, dataset_name, cross_dataset)
 
-    if args.dataset == "rescuenet":
+    if dataset_name == "rescuenet":
         from hurricane_debris.data.rescuenet import RescueNetDataset
         return RescueNetDataset(
             root_dir=dataset_root,
@@ -296,7 +311,7 @@ def load_dataset(args, config: ExperimentConfig, split: str):
             config=config.data,
             task="combined",
         )
-    elif args.dataset == "msnet":
+    elif dataset_name == "msnet":
         from hurricane_debris.data.msnet import MSNetDataset
         return MSNetDataset(
             root_dir=dataset_root,
@@ -304,7 +319,7 @@ def load_dataset(args, config: ExperimentConfig, split: str):
             config=config.data,
             task="combined",
         )
-    elif args.dataset == "designsafe":
+    elif dataset_name == "designsafe":
         from hurricane_debris.data.designsafe import DesignSafeDataset
         return DesignSafeDataset(
             root_dir=dataset_root,
@@ -319,6 +334,48 @@ def load_dataset(args, config: ExperimentConfig, split: str):
             config=config.data,
             task="combined",
         )
+
+
+def load_dataset(args, config: ExperimentConfig, split: str):
+    """Load the appropriate dataset based on CLI args."""
+    return _load_single_dataset(
+        args.dataset, args.dataset_dir, config, split,
+        getattr(args, "cross_dataset", False),
+    )
+
+
+def load_all_datasets(args, config: ExperimentConfig, split: str):
+    """Load and concatenate all available datasets for training.
+
+    Attempts to load rescuenet, msnet, and designsafe. Datasets that
+    cannot be loaded (e.g. missing annotations) are skipped with a
+    warning. Returns a ConcatDataset when multiple datasets are loaded,
+    or a single dataset if only one succeeds.
+    """
+    dataset_names = ["rescuenet", "msnet", "designsafe"]
+    datasets = []
+    for name in dataset_names:
+        try:
+            ds = _load_single_dataset(name, args.dataset_dir, config, split)
+            datasets.append(ds)
+            logger.info("Loaded %s [%s]: %d samples", name, split, len(ds))
+        except Exception as exc:
+            logger.warning("Skipping dataset '%s' (%s): %s", name, split, exc)
+
+    if not datasets:
+        raise RuntimeError(
+            f"No datasets could be loaded for split '{split}'. "
+            "Check that at least one dataset exists under --dataset-dir."
+        )
+    if len(datasets) == 1:
+        return datasets[0]
+
+    combined = torch.utils.data.ConcatDataset(datasets)
+    logger.info(
+        "Combined %d datasets for '%s': %d total samples",
+        len(datasets), split, len(combined),
+    )
+    return combined
 
 
 def download(args):
@@ -394,15 +451,20 @@ def _filter_empty_samples(dataset):
     return dataset
 
 
-def train_florence(args, config: ExperimentConfig):
+def train_florence(args, config: ExperimentConfig, use_all_datasets: bool = False):
     from hurricane_debris.models.florence2 import Florence2Trainer
 
     logger.info("=" * 60)
     logger.info("TRAINING FLORENCE-2")
     logger.info("=" * 60)
 
-    train_ds = load_dataset(args, config, "train")
-    val_ds = load_dataset(args, config, "val")
+    if use_all_datasets:
+        logger.info("Loading ALL available datasets for training")
+        train_ds = load_all_datasets(args, config, "train")
+        val_ds = load_all_datasets(args, config, "val")
+    else:
+        train_ds = load_dataset(args, config, "train")
+        val_ds = load_dataset(args, config, "val")
 
     # Filter out samples with no detections (empty targets waste forward passes)
     train_ds = _filter_empty_samples(train_ds)
@@ -412,15 +474,20 @@ def train_florence(args, config: ExperimentConfig):
     trainer.train(train_ds, val_ds)
 
 
-def train_sam2(args, config: ExperimentConfig):
+def train_sam2(args, config: ExperimentConfig, use_all_datasets: bool = False):
     from hurricane_debris.models.sam2_trainer import SAM2Trainer
 
     logger.info("=" * 60)
     logger.info("TRAINING SAM2")
     logger.info("=" * 60)
 
-    train_ds = load_dataset(args, config, "train")
-    val_ds = load_dataset(args, config, "val")
+    if use_all_datasets:
+        logger.info("Loading ALL available datasets for training")
+        train_ds = load_all_datasets(args, config, "train")
+        val_ds = load_all_datasets(args, config, "val")
+    else:
+        train_ds = load_dataset(args, config, "train")
+        val_ds = load_dataset(args, config, "val")
 
     trainer = SAM2Trainer(config=config.sam2, device=config.resolve_device())
     trainer.setup_fine_tuning()
@@ -553,13 +620,13 @@ def main():
     logger.info("Device: %s", config.resolve_device())
 
     if args.full_pipeline:
-        train_florence(args, config)
-        train_sam2(args, config)
+        train_florence(args, config, use_all_datasets=True)
+        train_sam2(args, config, use_all_datasets=True)
         evaluate(args, config)
     elif args.train_florence:
-        train_florence(args, config)
+        train_florence(args, config, use_all_datasets=(args.dataset == "all"))
     elif args.train_sam2:
-        train_sam2(args, config)
+        train_sam2(args, config, use_all_datasets=(args.dataset == "all"))
     elif args.evaluate:
         evaluate(args, config)
     elif args.infer:

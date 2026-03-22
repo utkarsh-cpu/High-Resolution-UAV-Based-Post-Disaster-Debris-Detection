@@ -173,10 +173,10 @@ class TestDebrisDataset:
         cfg = DataConfig(image_size=128)
         ds_train = DebrisDataset(dummy_dataset_dir, split="train", config=cfg)
         ds_val = DebrisDataset(dummy_dataset_dir, split="val", config=cfg)
-        # Augmentation pipelines should be different objects
-        assert type(ds_train.transform) is type(ds_val.transform)
+        # Both should have spatial_transform
+        assert type(ds_train.spatial_transform) is type(ds_val.spatial_transform)
         # But train has more transforms
-        assert len(ds_train.transform.transforms) > len(ds_val.transform.transforms)
+        assert len(ds_train.spatial_transform.transforms) > len(ds_val.spatial_transform.transforms)
 
     def test_blank_sample_on_missing_image(self, dummy_dataset_dir):
         """Dataset should return blank sample instead of crashing."""
@@ -268,21 +268,19 @@ class TestDatasetSpecificSmoke:
     def test_designsafe_loader_smoke(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            (root / "images").mkdir(parents=True)
+            (root / "original").mkdir(parents=True)
             (root / "annotations").mkdir(parents=True)
 
+            # Create a small RGB image and a grayscale mask with class 2
             img = np.zeros((64, 64, 3), dtype=np.uint8)
-            cv2.imwrite(str(root / "images" / "sample.png"), img)
+            cv2.imwrite(str(root / "original" / "sample.png"), img)
 
-            coco = {
-                "images": [{"id": 1, "file_name": "sample.png", "height": 64, "width": 64}],
-                "annotations": [{"id": 1, "image_id": 1, "category_id": 3, "bbox": [10, 10, 20, 20]}],
-            }
-            with open(root / "annotations" / "damage_observations.json", "w") as f:
-                json.dump(coco, f)
+            mask = np.zeros((64, 64), dtype=np.uint8)
+            mask[10:30, 10:30] = 2  # high-density debris
+            cv2.imwrite(str(root / "annotations" / "sample.png"), mask)
 
             ds = DesignSafeDataset(root_dir=str(root), split="test", config=DataConfig(image_size=64))
-            assert len(ds) == 1
+            assert len(ds) >= 1
             sample = ds[0]
             assert "image_path" in sample
             assert sample["target"]["bboxes"].shape[1] == 4

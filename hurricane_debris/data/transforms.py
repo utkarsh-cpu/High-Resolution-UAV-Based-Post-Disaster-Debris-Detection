@@ -93,3 +93,57 @@ def get_val_transforms(
             min_visibility=0.3,
         ),
     )
+
+
+# ── Split transforms (spatial + normalize) for raw_image support ─────────
+
+def get_train_spatial_transforms(
+    image_size: int = 768,
+    crop_scale: Tuple[float, float] = (0.8, 1.0),
+    color_jitter_p: float = 0.3,
+    gauss_noise_p: float = 0.2,
+) -> A.Compose:
+    """Spatial and colour augmentations *without* normalize / to-tensor.
+
+    Returns an augmented numpy RGB image plus adjusted bboxes/masks.
+    Call :func:`normalize_and_tensorize` afterwards to get ``pixel_values``.
+    """
+    return A.Compose(
+        [
+            _random_resized_crop(image_size=image_size, crop_scale=crop_scale),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.2),
+            A.RandomRotate90(p=0.5),
+            A.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, p=color_jitter_p
+            ),
+            _gauss_noise(gauss_noise_p=gauss_noise_p),
+        ],
+        bbox_params=A.BboxParams(
+            format="coco",
+            label_fields=["category_ids"],
+            min_visibility=0.3,
+        ),
+    )
+
+
+def get_val_spatial_transforms(image_size: int = 768) -> A.Compose:
+    """Resize only (no augmentation, no normalize)."""
+    return A.Compose(
+        [A.Resize(height=image_size, width=image_size)],
+        bbox_params=A.BboxParams(
+            format="coco",
+            label_fields=["category_ids"],
+            min_visibility=0.3,
+        ),
+    )
+
+
+def normalize_and_tensorize(
+    image: np.ndarray,
+    mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+    std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+) -> torch.Tensor:
+    """Normalize a uint8 HWC numpy image and convert to CHW float tensor."""
+    t = A.Compose([A.Normalize(mean=mean, std=std), ToTensorV2()])
+    return t(image=image)["image"]

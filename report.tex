@@ -1,0 +1,323 @@
+\documentclass[10pt,a4paper,twocolumn]{article}
+
+\usepackage[top=1.6cm, bottom=1.6cm, left=1.4cm, right=1.4cm, columnsep=0.6cm]{geometry}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{setspace}
+
+% Colors
+\definecolor{navyblue}{HTML}{1a1a2e}
+\definecolor{darkblue}{HTML}{16213e}
+\definecolor{accentblue}{HTML}{0f3460}
+
+% Section formatting
+\titleformat{\section}{\normalfont\bfseries\fontsize{10}{12}\selectfont\color{darkblue}}{\thesection.}{0.4em}{}[\vspace{-4pt}\textcolor{darkblue}{\rule{\linewidth}{0.5pt}}]
+\titleformat{\subsection}{\normalfont\bfseries\fontsize{9}{10.5}\selectfont\itshape}{\thesubsection}{0.4em}{}
+\titleformat{\subsubsection}{\normalfont\bfseries\fontsize{8.5}{10}\selectfont}{\thesubsubsection}{0.3em}{}
+\titlespacing{\section}{0pt}{8pt}{4pt}
+\titlespacing{\subsection}{0pt}{5pt}{2pt}
+\titlespacing{\subsubsection}{0pt}{4pt}{2pt}
+
+\setlength{\parskip}{3pt}
+\setlength{\parindent}{0pt}
+
+% Header/footer
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{\fontsize{7}{8}\selectfont\textcolor{darkblue}{\textit{High-Resolution UAV-Based Post-Disaster Debris Detection --- Project Report}}}
+\fancyhead[R]{\fontsize{7}{8}\selectfont\textcolor{darkblue}{MSDSM Batch 4}}
+\fancyfoot[C]{\fontsize{7}{8}\selectfont\thepage\ of \pageref{LastPage}}
+
+\hypersetup{colorlinks=true, urlcolor=accentblue, linkcolor=accentblue, citecolor=accentblue, breaklinks=true}
+\setlist[itemize]{noitemsep, topsep=2pt, leftmargin=*}
+\setlist[enumerate]{noitemsep, topsep=2pt, leftmargin=*}
+
+\captionsetup{font=small, labelfont=bf, skip=4pt}
+
+\begin{document}
+
+% ─── Title block ────────────────────────────────────────────────
+\twocolumn[{%
+\begin{center}
+  {\fontsize{14}{17}\bfseries\color{navyblue}
+    High-Resolution UAV-Based Post-Disaster Debris Detection:\\[2pt]
+    Fine-Tuning Foundation Models on Multi-Source Aerial Imagery}\\[8pt]
+  {\fontsize{10}{12}\selectfont
+    \textbf{Utkarsh Kaushik}}\\[2pt]
+  {\fontsize{9}{11}\selectfont
+    Roll No.\ 2404107067 \quad $\cdot$ \quad MSDSM Batch 4}\\[2pt]
+  {\fontsize{9}{11}\selectfont
+    Email: \href{mailto:utkarsh.kaushik@example.com}{utkarsh.kaushik@example.com} \quad $\cdot$ \quad Contact: +91-XXXXXXXXXX}\\[4pt]
+  {\fontsize{8.5}{10}\selectfont\textcolor{gray}{Computer Vision Course --- Project Report}}
+\end{center}
+\vspace{4pt}
+\textcolor{darkblue}{\rule{\linewidth}{1pt}}
+\vspace{6pt}
+}]
+
+% ═══════════════════════════════════════════════════════════════════
+\section{Introduction}
+% ═══════════════════════════════════════════════════════════════════
+
+Natural disasters cause devastating infrastructure damage, with hurricanes alone inflicting over \textbf{\$50 billion} in annual losses in the United States~[1]. Rapid and accurate debris assessment is essential for emergency response coordination, yet traditional manual surveys through ground teams are dangerous, time-consuming, and inherently unscalable. Unmanned Aerial Vehicles (UAVs) have emerged as indispensable tools for post-disaster reconnaissance, generating high-resolution imagery that exceeds satellite capabilities in both spatial resolution and temporal flexibility~[2].
+
+However, the sheer volume of UAV imagery---often thousands of images per sortie at 0.5--5\,cm/pixel ground sampling distance---presents a critical bottleneck: manual analysis cannot keep pace with data acquisition rates. Current deep learning approaches rely on fixed-category detectors that must be retrained for each disaster type, limiting their deployment flexibility.
+
+This project addresses \textbf{automated debris detection and pixel-accurate segmentation} from UAV imagery by combining two complementary foundation models in a cascaded pipeline:
+
+\begin{enumerate}
+  \item \textbf{Florence-2}~[3] (Microsoft)---an open-vocabulary vision-language model fine-tuned via Low-Rank Adaptation (LoRA)~[4] for debris detection with text-guided queries.
+  \item \textbf{SAM2}~[5] (Meta AI)---a Segment Anything model with its Hiera-Large backbone, partially fine-tuned for pixel-accurate instance segmentation of detected debris.
+\end{enumerate}
+
+The key contributions of this work are: (1)~a \textbf{parameter-efficient cascaded architecture} that leverages pre-trained foundation models with minimal fine-tuning overhead ($<$1\% additional parameters for Florence-2), (2)~a \textbf{unified 8-class debris taxonomy} that normalises annotations across three heterogeneous UAV datasets, (3)~\textbf{cross-dataset evaluation} demonstrating generalisation across disaster types, and (4)~an \textbf{end-to-end deployable system} with structured JSON/GeoJSON output and a Gradio web interface.
+
+
+% ═══════════════════════════════════════════════════════════════════
+\section{Methodology}
+% ═══════════════════════════════════════════════════════════════════
+
+The system implements a two-stage cascaded inference pipeline where Florence-2 localises debris objects as bounding boxes, and SAM2 generates pixel-accurate masks for each detection. Both models are fine-tuned on aerial disaster imagery while preserving their pre-trained capabilities.
+
+\subsection{Florence-2 Fine-Tuning for Detection}
+
+Florence-2-base-ft~[3] serves as the open-vocabulary detection backbone. Instead of full fine-tuning, we employ \textbf{Low-Rank Adaptation (LoRA)}~[4] to efficiently adapt the model to disaster-specific vocabulary while preserving general visual understanding. LoRA injects trainable low-rank matrices into the attention heads of the transformer layers.
+
+\textbf{LoRA configuration:} rank $r{=}16$, scaling factor $\alpha{=}16$, dropout $0.1$, targeting the query, key, value, and output projection matrices (\texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}). This adds only \textbf{$\sim$0.8\%} additional parameters compared to full fine-tuning, enabling rapid adaptation without catastrophic forgetting.
+
+The model is trained with the \texttt{<OD>} (object detection) task token, which activates vision-language grounding for bounding box prediction. The output format generates category names paired with normalised coordinate tokens \texttt{<loc\_0>\ldots<loc\_999>}. Training uses the AdamW optimiser with learning rate $5 \times 10^{-5}$, weight decay $0.01$, and a 10\% linear warmup followed by cosine decay. Effective batch size is 8 (batch size 4 $\times$ gradient accumulation 2). Training uses bfloat16 mixed precision on Ampere+ GPUs with early stopping at patience of 3 epochs.
+
+The collation strategy is critical: raw PIL images are preserved in the batch (rather than normalised tensors), avoiding lossy denormalise$\rightarrow$renormalise round-trips that degrade Florence-2's visual grounding accuracy.
+
+\subsection{SAM2 Fine-Tuning for Segmentation}
+
+SAM2 Hiera-Large~[5] provides pixel-accurate mask generation, guided by bounding box prompts from Florence-2. We adopt a \textbf{selective fine-tuning strategy}:
+
+\begin{itemize}
+  \item \textbf{Image encoder (Hiera):} Frozen---preserves general visual feature extraction learned from SA-1B.
+  \item \textbf{Prompt encoder:} Trainable---adapts box$\rightarrow$embedding mapping to aerial perspectives.
+  \item \textbf{Mask decoder:} Trainable---adapts mask prediction to debris boundary characteristics.
+\end{itemize}
+
+The combined loss function integrates Dice loss (for region overlap) and binary cross-entropy (for boundary refinement), both weighted equally ($w_\text{dice} = w_\text{bce} = 1.0$). Training uses AdamW with learning rate $1 \times 10^{-5}$ and cosine annealing with 10\% warmup. Multimask output generates 3 candidate masks per box, with selection by predicted IoU score.
+
+\textbf{Performance optimisations} significantly improve training throughput:
+\begin{itemize}
+  \item \textbf{Batched image encoding:} One forward pass per batch (not per image), yielding $\sim$4$\times$ speedup.
+  \item \textbf{Batched mask decoding:} All boxes per image processed in a single decoder call.
+  \item \textbf{AMP} with bfloat16 autocast reduces memory by $\sim$40\%.
+  \item \textbf{torch.compile()} on the mask decoder fuses CUDA kernels.
+  \item \textbf{Gradient checkpointing} on the mask decoder reduces peak VRAM usage.
+\end{itemize}
+
+\subsection{Cascaded Inference Pipeline}
+
+At inference time, the two models are chained:
+
+\begin{enumerate}
+  \item \textbf{Detection:} Florence-2 processes the input image with the \texttt{<OD>} prompt, producing bounding boxes with category labels and confidence scores.
+  \item \textbf{Filtering:} Detections below a configurable score threshold (default 0.3) and degenerate bounding boxes ($<$2px side length) are removed.
+  \item \textbf{Segmentation:} SAM2 generates a pixel-accurate mask for each surviving bounding box.
+  \item \textbf{Priority sorting:} Detections are sorted by a debris taxonomy priority (critical $\rightarrow$ high $\rightarrow$ medium $\rightarrow$ low), then by confidence score.
+  \item \textbf{Export:} Structured JSON (detections with metadata) and image-pixel GeoJSON (bounding box polygons) are generated.
+\end{enumerate}
+
+The \textbf{priority taxonomy} maps debris categories to response urgency: \textit{critical} (damaged buildings, damaged roads), \textit{high} (water/flooding, vehicles), \textit{medium} (vegetation), \textit{low} (intact structures). This enables emergency response teams to prioritise actionable detections.
+
+
+\subsection{Data Augmentation}
+
+The augmentation pipeline uses Albumentations~[6] with bounding-box-aware spatial transforms:
+
+\begin{itemize}
+  \item \textbf{Spatial:} RandomResizedCrop (scale 0.8--1.0), HorizontalFlip ($p{=}0.5$), VerticalFlip ($p{=}0.2$), RandomRotate90 ($p{=}0.5$)
+  \item \textbf{Photometric:} ColorJitter (brightness, contrast, saturation $= 0.2$, $p{=}0.3$), GaussNoise (std $10$--$50/255$, $p{=}0.2$)
+  \item \textbf{Normalisation:} ImageNet mean and std.
+\end{itemize}
+
+Validation and test sets use resize-only transforms with no random augmentation.
+
+% ═══════════════════════════════════════════════════════════════════
+\section{Database}
+% ═══════════════════════════════════════════════════════════════════
+
+The system is evaluated on three complementary high-resolution UAV datasets, unified under an 8-class debris taxonomy (Table~\ref{tab:taxonomy}).
+
+\begin{table}[h]
+\centering
+\caption{Unified 8-class debris taxonomy. All datasets are mapped to this common schema.}
+\label{tab:taxonomy}
+\fontsize{8}{9.5}\selectfont
+\begin{tabular}{clll}
+\toprule
+\textbf{ID} & \textbf{Class} & \textbf{Priority} & \textbf{Description} \\
+\midrule
+0 & background & --- & Non-debris \\
+1 & water & high & Flooded areas \\
+2 & building\_no\_damage & low & Intact structures \\
+3 & building\_damaged & critical & Collapsed buildings \\
+4 & vegetation & medium & Downed trees \\
+5 & road\_no\_damage & low & Clear roads \\
+6 & road\_damaged & critical & Blocked roads \\
+7 & vehicle & high & Vehicle wreckage \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{RescueNet (Primary)}
+
+\textbf{Source:} Alam et al.~[1], IEEE TGRS 2022. \textbf{Scale:} 4,494 images at 0.5--2\,cm/pixel GSD from Hurricane Michael (Florida, 2018). Provides pixel-level semantic segmentation masks with 8 classes. The official release includes 11 fine-grained categories (e.g., Building-Minor-Damage, Building-Major-Damage, Building-Total-Destruction) that are remapped to our 8-class taxonomy by merging damage levels. Official train/val/test splits are used as provided.
+
+The loader supports both the original flat directory layout and the Dropbox distribution layout where RGB colour masks (\texttt{ColorMasks-RescueNet}) sit alongside the imagery. Colour masks are automatically decoded via an RGB palette lookup. Instance bounding boxes are extracted from semantic masks using connected-component analysis with a minimum area threshold of 100 pixels.
+
+\subsection{MSNet / ISBDA (Cross-dataset)}
+
+\textbf{Source:} Xie \& Xiong~[7], Remote Sensing 2023; Zhu et al.~[8], WACV 2021. \textbf{Scale:} 8,700+ images across 7 disaster events (hurricanes, earthquakes, tsunamis) at 0.3--5\,cm/pixel. Provides COCO-format instance annotations with oriented bounding boxes (DOTA format) and multi-level damage classification (Slight, Severe, Debris). All damage levels are mapped to \texttt{building\_damaged}. Oriented bounding boxes are automatically converted to axis-aligned boxes for SAM2 compatibility.
+
+\subsection{DesignSafe-CI PRJ-6029 (Cross-dataset)}
+
+\textbf{Source:} Amini et al.~[2], NSF NHERI DesignSafe-CI. \textbf{Scale:} 1,242 images (508 with masks) from Hurricanes Ian, Ida, and Ike. Provides 3-class binary debris masks (no debris, low density, high density). Both density levels map to \texttt{building\_damaged}. Data splits use stratified 70/15/15 ratios, splitting images with and without masks separately. Empty samples (no foreground annotations) are filtered before training.
+
+\subsection{Cross-Dataset Evaluation Protocol}
+
+The primary evaluation trains on \textbf{RescueNet} and tests on all three datasets, including cross-dataset testing on MSNet and DesignSafe-CI holdout sets. This evaluates generalisation across different disaster types, UAV platforms, camera angles, and annotation styles.
+
+
+% ═══════════════════════════════════════════════════════════════════
+\section{Results and Discussion}
+% ═══════════════════════════════════════════════════════════════════
+
+\subsection{Evaluation Metrics}
+
+We employ a comprehensive set of metrics:
+\begin{itemize}
+  \item \textbf{mIoU:} Mean Intersection-over-Union for pixel-level segmentation, computed per-class excluding background.
+  \item \textbf{F1-Score:} Detection-level F1 at IoU threshold 0.5.
+  \item \textbf{Precision/Recall:} Detection-level metrics.
+  \item \textbf{AP@50, AP@75:} Average Precision at specific IoU thresholds.
+  \item \textbf{AP@[0.5:0.95]:} COCO-style mean AP across 10 IoU thresholds (0.5, 0.55, \ldots, 0.95), using 11-point interpolation.
+\end{itemize}
+
+Detection matching uses IoU-based greedy assignment. Confusion matrices are accumulated for per-class mIoU computation.
+
+\subsection{Quantitative Results}
+
+\begin{table}[h]
+\centering
+\caption{Evaluation results on RescueNet and MSNet test sets. mIoU is reported excluding background.}
+\label{tab:results}
+\fontsize{8}{9.5}\selectfont
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{RescueNet} & \textbf{MSNet} \\
+\midrule
+mIoU              & 0.1137 & 0.0137 \\
+F1                & 0.3606 & 0.0698 \\
+Precision         & 0.3527 & 0.0437 \\
+Recall            & 0.3689 & 0.1732 \\
+AP@50             & 0.1387 & 0.0126 \\
+AP@75             & 0.1102 & 0.0057 \\
+AP@[0.5:0.95]     & 0.0987 & 0.0066 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Per-class IoU on the RescueNet test set.}
+\label{tab:perclass}
+\fontsize{8}{9.5}\selectfont
+\begin{tabular}{lclc}
+\toprule
+\textbf{Class} & \textbf{IoU} & \textbf{Class} & \textbf{IoU} \\
+\midrule
+background         & 0.5888 & vegetation      & 0.0221 \\
+water              & 0.2132 & road\_no\_damage & 0.0267 \\
+building\_no\_damage & 0.0756 & road\_damaged    & 0.0788 \\
+building\_damaged   & 0.2030 & vehicle         & 0.1765 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+
+\textbf{RescueNet} (Table~\ref{tab:results})---the primary training dataset---achieves the strongest performance with an F1 of 0.3606 and mIoU of 0.1137. Per-class analysis (Table~\ref{tab:perclass}) reveals that semantically salient categories perform best: \texttt{water} (IoU 0.2132), \texttt{building\_damaged} (IoU 0.2030), and \texttt{vehicle} (IoU 0.1765). These correspond to categories with distinctive visual signatures that Florence-2's open-vocabulary grounding can effectively localise.
+
+The lower performance on thin or spatially distributed classes (\texttt{vegetation} at 0.0221, \texttt{road\_no\_damage} at 0.0267) reflects the challenge of pixel-level IoU evaluation for objects whose masks do not tightly conform to bounding box predictions---a known limitation of box-prompted segmentation.
+
+\textbf{MSNet} cross-dataset results show expected degradation (F1 0.0698, mIoU 0.0137), primarily because: (1)~MSNet covers 7 disaster types versus RescueNet's single hurricane event, introducing significant domain shift; (2)~MSNet uses damage-level annotations (Slight/Severe/Debris) that collapse to a single \texttt{building\_damaged} class, reducing category diversity; (3)~different UAV altitudes and camera configurations across MSNet's multi-event collection create visual distribution gaps.
+
+Notably, MSNet recall (0.1732) substantially exceeds precision (0.0437), indicating that the model detects debris regions but generates many false positives in unfamiliar visual contexts---a characteristic of open-vocabulary models operating outside their fine-tuning distribution.
+
+\subsection{Priority-Based Output}
+
+The priority taxonomy enables actionable output for emergency response. Detections are sorted so that \textit{critical} infrastructure damage (collapsed buildings, blocked roads) appears first, followed by \textit{high}-priority flooding and vehicle wreckage. This deterministic ordering ensures consistent output across identical inputs.
+
+\subsection{Deployment Interface}
+
+The Gradio web interface accepts arbitrary UAV images with customisable open-vocabulary query text and score thresholds. Outputs include structured JSON with detection metadata (bounding boxes, confidence scores, categories, priorities) and image-pixel GeoJSON for downstream GIS integration. The standalone demo script (\texttt{demo.py}) processes sample images and saves annotated visualisations with overlaid masks and bounding boxes.
+
+\subsection{Challenges Faced}
+
+Several significant challenges arose during development. \textbf{Transformers 5.x compatibility} was a persistent issue: the cached Florence-2 remote code broke across multiple API changes---\texttt{forced\_bos\_token\_id} attribute access, \texttt{\_supports\_sdpa} property timing during \texttt{\_\_init\_\_}, and \texttt{past\_key\_values} changing from tuples to \texttt{EncoderDecoderCache} objects---requiring runtime monkey-patching of the HuggingFace-cached source files. \textbf{Dataset heterogeneity} posed another major challenge: RescueNet provides semantic masks (grayscale and RGB colour-coded), MSNet uses COCO-format instances with oriented bounding boxes, and DesignSafe-CI has sparse binary masks with only 41\% annotated images. Unifying these into a single taxonomy required writing three separate loaders with automatic layout detection, colour-mask decoding, oriented-to-axis-aligned bbox conversion, and connected-component instance extraction. \textbf{GPU memory constraints} during SAM2 training were addressed through batched image encoding, gradient checkpointing, and mixed-precision training, but initial na\"ive per-box inference caused frequent OOM errors that required substantial architectural rethinking. Finally, Florence-2's \texttt{<OD>} versus \texttt{<OPEN\_VOCABULARY\_DETECTION>} task tokens produced drastically different behaviours---the latter generated degenerate bounding box coordinates without proper spatial grounding---a subtlety not well-documented that required extensive debugging.
+
+\subsection{What Could Be Improved}
+
+Several aspects of the system could yield substantially better results with additional effort. \textbf{Training duration and schedule:} The current results reflect relatively early checkpoints; extended training with cosine warm-restart schedules and longer patience windows would improve convergence, particularly on underrepresented classes like \texttt{vegetation} and \texttt{road\_no\_damage}. \textbf{Class imbalance handling:} The 8-class taxonomy suffers from severe imbalance---\texttt{background} dominates most images while critical categories like \texttt{road\_damaged} appear rarely. Focal loss for Florence-2 and class-weighted Dice loss for SAM2, combined with oversampling of minority-class images, would address this directly. \textbf{Multi-scale inference:} Current processing resizes all images to a fixed 768$\times$768 resolution, losing fine-grained detail in high-resolution UAV imagery. A sliding-window or tiled inference approach with non-maximum suppression across tiles would better exploit the native centimetre-level resolution. \textbf{Cross-dataset pre-training:} Training Florence-2 jointly on all three datasets (rather than RescueNet alone) with domain-specific data mixing ratios could improve generalisation. \textbf{End-to-end fine-tuning:} Unfreezing the SAM2 image encoder for shallow-layer adaptation (last 2--3 blocks only) could help the model learn aerial-specific visual features without catastrophic forgetting, potentially closing the gap on spatially distributed classes.
+
+
+% ═══════════════════════════════════════════════════════════════════
+\section{Conclusion}
+% ═══════════════════════════════════════════════════════════════════
+
+This project demonstrates a \textbf{cascaded foundation model pipeline} for post-disaster debris detection from UAV imagery, combining Florence-2's open-vocabulary detection with SAM2's instance segmentation. The system achieves the following:
+
+\begin{enumerate}
+  \item \textbf{Parameter-efficient domain adaptation:} LoRA fine-tuning adds only 0.8\% parameters to Florence-2, enabling rapid adaptation to disaster-specific categories without catastrophic forgetting of general visual understanding.
+  \item \textbf{Unified multi-source evaluation:} Three heterogeneous UAV datasets (RescueNet, MSNet, DesignSafe-CI) are normalised to a common 8-class taxonomy, establishing a cross-dataset benchmark for aerial debris detection.
+  \item \textbf{Optimised inference:} Batched SAM2 processing ($\sim$4$\times$ speedup over per-box inference), mixed-precision computation, and \texttt{torch.compile()} enable deployment-friendly performance.
+  \item \textbf{Deployable system:} Complete pipeline from training to inference with structured JSON/GeoJSON export, Gradio web interface, and reproducible experiment framework.
+\end{enumerate}
+
+\textbf{Limitations and future work:} Current results reflect early training checkpoints; extended training with curriculum learning and class-balanced sampling would improve performance on underrepresented categories. GeoJSON export currently uses image-pixel coordinates; full georeferenced output requires camera pose and orthorectification metadata not available in current datasets. Future directions include real-time video inference, fine-grained debris classification (concrete vs.\ metal vs.\ wood), and federated learning for privacy-preserving collaborative model improvement across response organisations.
+
+
+% ═══════════════════════════════════════════════════════════════════
+\section{References}
+% ═══════════════════════════════════════════════════════════════════
+
+\fontsize{7.5}{9.5}\selectfont
+\setlength{\parskip}{2pt}
+
+\noindent[1] M.\,S.\ Alam et al., ``RescueNet: A High-Resolution Post-Disaster UAV Dataset for Semantic Segmentation,'' \textit{IEEE Trans.\ Geosci.\ Remote Sens.}, vol.~60, 2022.
+
+\noindent[2] K.\ Amini et al., ``Hurricane-Induced Debris Segmentation Dataset Using Aerial Imagery'' [v2], DesignSafe-CI, 2025. \href{https://doi.org/10.17603/ds2-jvps-2n95}{doi:10.17603/ds2-jvps-2n95}
+
+\noindent[3] W.\ Xiao et al., ``Florence-2: Advancing a Unified Representation for a Variety of Vision Tasks,'' \textit{CVPR}, 2024.
+
+\noindent[4] E.\,J.\ Hu et al., ``LoRA: Low-Rank Adaptation of Large Language Models,'' \textit{ICLR}, 2022.
+
+\noindent[5] N.\ Ravi et al., ``SAM~2: Segment Anything in Images and Videos,'' \textit{arXiv:2408.00714}, 2024.
+
+\noindent[6] A.\ Buslaev et al., ``Albumentations: Fast and Flexible Image Augmentations,'' \textit{Information}, vol.~11, no.~2, p.~125, 2020.
+
+\noindent[7] X.\ Xie and Z.\ Xiong, ``Multilevel Instance Segmentation for Natural Disaster Damage Assessment in Aerial Videos,'' \textit{Remote Sensing}, 2023.
+
+\noindent[8] X.\ Zhu, J.\ Liang, and A.\ Hauptmann, ``MSNet: A Multilevel Instance Segmentation Network for Natural Disaster Damage Assessment in Aerial Videos,'' \textit{WACV}, pp.~2023--2032, 2021.
+
+\end{document}

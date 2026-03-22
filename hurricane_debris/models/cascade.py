@@ -28,7 +28,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional for lightweight envir
 from PIL import Image
 
 from hurricane_debris.config import DEBRIS_CATEGORIES, ExperimentConfig
-from hurricane_debris.models.florence2 import load_florence_processor
+from hurricane_debris.models.florence2 import load_florence_processor, _fix_florence2_weight_tying
 from hurricane_debris.utils.logging import get_logger
 
 logger = get_logger("models.cascade")
@@ -119,6 +119,94 @@ _PRIORITY_MAP = {
 }
 
 
+def _patch_florence2_config():
+    """Patch cached Florence-2 remote code for Transformers 5.x compatibility.
+
+    Fixes three issues in the HuggingFace-cached Florence-2 code:
+
+    1. ``Florence2LanguageConfig`` accesses ``self.forced_bos_token_id``
+       after ``super().__init__()``, but Transformers 5.x no longer
+       creates attributes for ``None``-valued kwargs → use ``getattr``.
+
+    2. ``Florence2ForConditionalGeneration`` defines ``_supports_sdpa``
+       as a ``@property`` that reads ``self.language_model``, but
+       Transformers 5.x checks it during ``__init__`` before the
+       sub-model exists → add a class-level fallback attribute.
+
+    3. ``past_key_values[0][0].shape[2]`` fails in Transformers 5.x
+       because ``past_key_values`` is now an ``EncoderDecoderCache``
+       object instead of a tuple → use ``get_seq_length()`` when available.
+    """
+    import glob, os
+
+    base = "/home/.cache/huggingface/modules/transformers_modules"
+    cfg_pattern = os.path.join(base, "**", "configuration_florence2.py")
+    mdl_pattern = os.path.join(base, "**", "modeling_florence2.py")
+
+    for path in glob.glob(cfg_pattern, recursive=True):
+        with open(path) as f:
+            src = f.read()
+        old_check = "if self.forced_bos_token_id is None and kwargs.get("
+        new_check = "if getattr(self, 'forced_bos_token_id', None) is None and kwargs.get("
+        if old_check in src:
+            src = src.replace(old_check, new_check)
+            with open(path, "w") as f:
+                f.write(src)
+            logger.info("Patched %s (forced_bos_token_id)", path)
+
+    for path in glob.glob(mdl_pattern, recursive=True):
+        with open(path) as f:
+            src = f.read()
+        changed = False
+
+        # Add class-level _supports_sdpa = True so it's available during __init__
+        marker = "class Florence2ForConditionalGeneration(Florence2PreTrainedModel):\n"
+        patched_marker = (
+            "class Florence2ForConditionalGeneration(Florence2PreTrainedModel):\n"
+            "    _supports_sdpa = True\n"
+        )
+        if marker in src and "_supports_sdpa = True\n    _tied_weights_keys" not in src:
+            src = src.replace(marker, patched_marker)
+            changed = True
+
+        # Fix torch.linspace().item() on meta tensors
+        old_linspace = "[x.item() for x in torch.linspace(0, drop_path_rate, sum(depths)*2)]"
+        new_linspace = "torch.linspace(0, drop_path_rate, sum(depths)*2, device='cpu').tolist()"
+        if old_linspace in src:
+            src = src.replace(old_linspace, new_linspace)
+            changed = True
+
+        # Fix past_key_values subscript for EncoderDecoderCache in Transformers 5.x
+        old_past = "past_key_values[0][0].shape[2]"
+        new_past = "(past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else past_key_values[0][0].shape[2])"
+        if old_past in src:
+            src = src.replace(old_past, new_past)
+            changed = True
+
+        # Fix past_key_values_length subscript in decoder forward
+        old_past_len = "past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0"
+        new_past_len = "past_key_values_length = (past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else past_key_values[0][0].shape[2]) if past_key_values is not None else 0"
+        if old_past_len in src:
+            src = src.replace(old_past_len, new_past_len)
+            changed = True
+
+        if changed:
+            with open(path, "w") as f:
+                f.write(src)
+            logger.info("Patched %s for Transformers 5.x compat", path)
+
+    # Invalidate cached imports so Python re-reads the patched files
+    import sys
+    to_remove = [k for k in sys.modules if "florence2" in k.lower() and "transformers_modules" in k]
+    for k in to_remove:
+        del sys.modules[k]
+
+    # Remove stale .pyc files
+    for pyc in glob.glob(os.path.join(base, "**", "*.pyc"), recursive=True):
+        if "florence2" in pyc.lower():
+            os.remove(pyc)
+
+
 class CascadedInference:
     """
     End-to-end cascaded pipeline:
@@ -149,17 +237,44 @@ class CascadedInference:
     # ── Model loading ────────────────────────────────────────────────────
 
     def _load_florence(self, model_dir: str):
-        from transformers import AutoModelForCausalLM
+        from pathlib import Path
 
         logger.info("Loading fine-tuned Florence-2 from %s", model_dir)
         self.florence_processor = load_florence_processor(model_dir)
-        self.florence_model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch.float32, trust_remote_code=True
-        ).to(self.device).eval()
+
+        _patch_florence2_config()
+
+        adapter_config = Path(model_dir) / "adapter_config.json"
+        if adapter_config.exists():
+            # LoRA adapter directory — load base model then merge adapter
+            import json
+            with open(adapter_config) as f:
+                acfg = json.load(f)
+            base_model_id = acfg.get("base_model_name_or_path", "microsoft/Florence-2-base-ft")
+            base_model = self._load_florence_base(base_model_id)
+            from peft import PeftModel
+            self.florence_model = PeftModel.from_pretrained(
+                base_model, model_dir
+            ).merge_and_unload().to(self.device).eval()
+        else:
+            # Full model checkpoint
+            self.florence_model = self._load_florence_base(model_dir).to(self.device).eval()
+
+    @staticmethod
+    def _load_florence_base(model_id: str):
+        """Load a Florence-2 base model, patching config for Transformers 5.x compat."""
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.float32, trust_remote_code=True
+        )
+        _fix_florence2_weight_tying(model)
+        return model
 
     def _load_sam2(self, checkpoint: str):
         try:
             from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
         except ImportError:
             raise ImportError(
                 "SAM2 not installed. Install from: "
@@ -167,9 +282,21 @@ class CascadedInference:
             )
 
         logger.info("Loading fine-tuned SAM2 from %s", checkpoint)
+        state_dict = torch.load(checkpoint, map_location=self.device)
+        if isinstance(state_dict, dict) and "model" in state_dict:
+            state_dict = state_dict["model"]
+
+        # Strip torch.compile _orig_mod. prefix if present
+        cleaned = {}
+        for k, v in state_dict.items():
+            cleaned[k.replace("._orig_mod.", ".")] = v
+
         self.sam2_model = build_sam2(
-            self.config.sam2.model_cfg, checkpoint
-        ).to(self.device).eval()
+            self.config.sam2.model_cfg
+        ).to(self.device)
+        self.sam2_model.load_state_dict(cleaned)
+        self.sam2_model.eval()
+        self.sam2_predictor = SAM2ImagePredictor(self.sam2_model)
 
     # ── Inference ────────────────────────────────────────────────────────
 
@@ -184,7 +311,11 @@ class CascadedInference:
 
         Returns list of Detection objects with bboxes and category names.
         """
-        prompt = f"<OPEN_VOCABULARY_DETECTION>{query}"
+        # The fine-tuned model uses the <OD> (object detection) task token,
+        # which activates proper vision-language grounding for precise bbox
+        # prediction.  Using <OPEN_VOCABULARY_DETECTION> without a query
+        # disables spatial grounding and produces degenerate coordinates.
+        prompt = "<OD>"
 
         inputs = self.florence_processor(
             text=prompt, images=image, return_tensors="pt"
@@ -195,20 +326,25 @@ class CascadedInference:
             pixel_values=inputs["pixel_values"],
             max_new_tokens=self.config.florence2.max_new_tokens,
             num_beams=self.config.florence2.num_beams,
+            use_cache=False,
         )
 
         text = self.florence_processor.batch_decode(
             generated_ids, skip_special_tokens=False
         )[0]
 
+        logger.info("Florence-2 raw output: %s", text[:500])
+
         parsed = self.florence_processor.post_process_generation(
             text,
-            task="<OPEN_VOCABULARY_DETECTION>",
+            task="<OD>",
             image_size=(image.width, image.height),
         )
 
+        logger.info("Florence-2 parsed result: %s", parsed)
+
         detections = []
-        det_data = parsed.get("<OPEN_VOCABULARY_DETECTION>", {})
+        det_data = parsed.get("<OD>", {})
         bboxes = det_data.get("bboxes", [])
         labels = det_data.get("bboxes_labels", det_data.get("labels", []))
         scores = det_data.get("scores", [1.0] * len(bboxes))
@@ -239,68 +375,26 @@ class CascadedInference:
         if not detections:
             return detections
 
-        import torch.nn.functional as F
-
-        img_np = np.array(image)
-        img_tensor = (
-            torch.from_numpy(img_np).float().permute(2, 0, 1) / 255.0
-        ).to(self.device)
-
-        # Image embedding (shared across all boxes)
-        img_input = img_tensor.unsqueeze(0)
-        image_embedding = self.sam2_model.image_encoder(img_input)
-
-        if isinstance(image_embedding, dict):
-            backbone_out = image_embedding
-        else:
-            backbone_out = {"vision_features": image_embedding}
-
-        if hasattr(self.sam2_model, '_prepare_backbone_features'):
-            _, vision_feats, vision_pos_embeds, feat_sizes = (
-                self.sam2_model._prepare_backbone_features(backbone_out)
-            )
-            B = 1
-            image_embed = vision_feats[-1].reshape(B, -1, feat_sizes[-1][0], feat_sizes[-1][1])
-            high_res_feats = [
-                vf.reshape(B, -1, fs[0], fs[1])
-                for vf, fs in zip(vision_feats[:-1], feat_sizes[:-1])
-            ]
-        else:
-            image_embed = backbone_out if torch.is_tensor(backbone_out) else backbone_out["vision_features"]
-            high_res_feats = []
+        # Use SAM2ImagePredictor which handles image transforms, feature
+        # extraction (including no_mem_embed), and proper box→point prompt
+        # conversion internally.
+        self.sam2_predictor.set_image(image)
 
         for det in detections:
             x1, y1, x2, y2 = det.bbox
-            box_coords = torch.tensor(
-                [[x1, y1, x2, y2]], dtype=torch.float32, device=self.device
-            )
+            box_np = np.array([[x1, y1, x2, y2]], dtype=np.float32)
 
-            sparse_emb, dense_emb = self.sam2_model.sam_prompt_encoder(
-                points=None, boxes=box_coords, masks=None
-            )
-
-            decoder_out = self.sam2_model.sam_mask_decoder(
-                image_embeddings=image_embed,
-                image_pe=self.sam2_model.sam_prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_emb,
-                dense_prompt_embeddings=dense_emb,
+            masks, iou_pred, _ = self.sam2_predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=box_np,
                 multimask_output=True,
-                high_res_features=high_res_feats if high_res_feats else None,
             )
-            low_res_masks, iou_pred = decoder_out[0], decoder_out[1]
 
-            best_idx = iou_pred.argmax(dim=-1)
-            best_mask = low_res_masks[0, best_idx]
+            best_idx = int(iou_pred.argmax())
+            det.mask = masks[best_idx].astype(np.uint8)
 
-            mask_full = F.interpolate(
-                best_mask.unsqueeze(0),
-                size=(image.height, image.width),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze().cpu().numpy()
-
-            det.mask = (mask_full > 0).astype(np.uint8)
-
+        self.sam2_predictor.reset_predictor()
         logger.info("SAM2 generated masks for %d detections", len(detections))
         return detections
 
@@ -331,6 +425,14 @@ class CascadedInference:
 
         # Filter by score
         detections = [d for d in detections if d.score >= score_threshold]
+
+        # Drop degenerate bboxes (zero or near-zero area)
+        min_side = 2.0  # minimum bbox side in pixels
+        detections = [
+            d for d in detections
+            if abs(d.bbox[2] - d.bbox[0]) >= min_side
+            and abs(d.bbox[3] - d.bbox[1]) >= min_side
+        ]
 
         # Stage 2: Segment
         detections = self.segment(image, detections)
@@ -389,24 +491,39 @@ class CascadedInference:
     def _normalize_category(raw_label: str) -> str:
         """Map Florence-2 free-form label to a canonical category name."""
         label = raw_label.lower().strip()
-        mapping = {
-            "debris": "building_damaged",
-            "damaged building": "building_damaged",
-            "collapsed building": "building_damaged",
-            "building": "building_no_damage",
-            "flooded area": "water",
-            "flood": "water",
-            "water": "water",
-            "downed tree": "vegetation",
-            "tree": "vegetation",
-            "vegetation": "vegetation",
-            "damaged road": "road_damaged",
-            "road": "road_no_damage",
-            "vehicle wreckage": "vehicle",
-            "vehicle": "vehicle",
-            "car": "vehicle",
+
+        # Exact matches for training-time CATEGORY_QUERIES labels first
+        exact = {
+            "flooded area with standing water": "water",
+            "intact undamaged building": "building_no_damage",
+            "damaged or collapsed building with debris": "building_damaged",
+            "vegetation and downed trees": "vegetation",
+            "intact undamaged road": "road_no_damage",
+            "damaged road with cracks or debris": "road_damaged",
+            "vehicle or vehicle wreckage": "vehicle",
         }
-        for key, val in mapping.items():
+        if label in exact:
+            return exact[label]
+
+        # Substring matches — more specific phrases checked before generic ones
+        mapping = [
+            ("damaged road", "road_damaged"),
+            ("damaged building", "building_damaged"),
+            ("collapsed building", "building_damaged"),
+            ("vehicle wreckage", "vehicle"),
+            ("downed tree", "vegetation"),
+            ("flooded area", "water"),
+            ("debris", "building_damaged"),
+            ("flood", "water"),
+            ("water", "water"),
+            ("vegetation", "vegetation"),
+            ("tree", "vegetation"),
+            ("road", "road_no_damage"),
+            ("building", "building_no_damage"),
+            ("vehicle", "vehicle"),
+            ("car", "vehicle"),
+        ]
+        for key, val in mapping:
             if key in label:
                 return val
         return "building_damaged"  # conservative default
